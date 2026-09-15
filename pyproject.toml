@@ -1,0 +1,11 @@
+[project]
+name = "experiments"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "matplotlib>=3.11.1",
+    "nvidia-physicsnemo[sym]>=2.2.1",
+    "pyvista>=0.48.4",
+]
