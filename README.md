@@ -33,6 +33,33 @@ pinn_training/
 
 ---
 
+## 🚀 Installation
+
+### 1. Install `uv`
+
+
+```bash
+brew install uv
+```
+
+
+### 2. Create the virtual environment and install
+
+```bash
+# From the repo root (pinn_training/)
+uv sync
+```
+
+### 4. Run scripts
+
+Use `.venv/bin/python` to invoke any script directly (no need to activate the environment):
+
+```bash
+.venv/bin/python training/train_steady.py
+```
+
+---
+
 ## 🔬 Physics & Governing Equations
 
 The framework solves the **3D Incompressible Navier-Stokes Equations** coupled with a **Pollutant Advection-Diffusion-Reaction Equation**:
@@ -139,7 +166,7 @@ The inference scripts evaluate the neural network over 3D spatial grids and part
 
 ---
 
-#### 2.1 Generating Time-Dependent Visualizations ([inference_time_dependent.py](file:///Users/wb/Documents/Personal/FUAS/8_Thesis/code/pinn_training/inference/inference_time_dependent.py))
+#### 2.1 Generating Time-Dependent Visualizations ([inference/inference_time_dependent.py](inference/inference_time_dependent.py))
 
 ```bash
 # 1. Spatiotemporal point probe at (x=7.0, y=4.5, z=1.5) at t=30s
@@ -176,7 +203,7 @@ The inference scripts evaluate the neural network over 3D spatial grids and part
 
 ---
 
-#### 2.2 Generating 5D Parametric Visualizations ([inference_parametric.py](file:///Users/wb/Documents/Personal/FUAS/8_Thesis/code/pinn_training/inference/inference_parametric.py))
+#### 2.2 Generating 5D Parametric Visualizations ([inference/inference_parametric.py](inference/inference_parametric.py))
 
 ```bash
 # 1. Probe for V_inlet = 1.5 m/s at t = 20s
@@ -205,7 +232,7 @@ The inference scripts evaluate the neural network over 3D spatial grids and part
 
 ---
 
-#### 2.3 Generating 6D Parametric Occupancy Visualizations ([inference_parametric_occupancy.py](file:///Users/wb/Documents/Personal/FUAS/8_Thesis/code/pinn_training/inference/inference_parametric_occupancy.py))
+#### 2.3 Generating 6D Parametric Occupancy Visualizations ([inference/inference_parametric_occupancy.py](inference/inference_parametric_occupancy.py))
 
 ```bash
 # 1. Probe point (x=7.0, y=4.5, z=1.1) at t=30s for V_inlet = 1.5 m/s and N_people = 30
@@ -234,7 +261,7 @@ The inference scripts evaluate the neural network over 3D spatial grids and part
 
 ---
 
-#### 2.3 Generating Steady-State Visualizations ([inference_steady.py](file:///Users/wb/Documents/Personal/FUAS/8_Thesis/code/pinn_training/inference/inference_steady.py))
+#### 2.3 Generating Steady-State Visualizations ([inference/inference_steady.py](inference/inference_steady.py))
 
 ```bash
 # Export 3D volume, steady streamlines, and spatial slice sweep
@@ -265,7 +292,7 @@ The inference scripts evaluate the neural network over 3D spatial grids and part
 
 ---
 
-#### 3.2 Headless Batch Rendering with `pvpython` ([paraview_animate.py](file:///Users/wb/Documents/Personal/FUAS/8_Thesis/code/pinn_training/rendering/paraview_animate.py))
+#### 3.2 Headless Batch Rendering with `pvpython` ([rendering/paraview_animate.py](rendering/paraview_animate.py))
 
 You can render full HD PNG image sequences or AVI videos directly from the command line:
 
