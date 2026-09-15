@@ -22,6 +22,10 @@ import torch
 
 from physicsnemo.models.mlp.fully_connected import FullyConnected
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+GEOM_DIR = os.path.join(REPO_ROOT, "geometries")
+OUTPUT_DIR = os.path.join(REPO_ROOT, "outputs")
+
 
 def select_device(requested_device: str = "auto") -> torch.device:
     """Select the most optimal hardware device available."""
@@ -231,7 +235,7 @@ def export_unsteady_particles(
 
 def main() -> None:
     date_str = datetime.now().strftime("%Y-%m-%d")
-    default_dir = os.path.join("./outputs", date_str, "time_dependent")
+    default_dir = os.path.join(OUTPUT_DIR, date_str, "time_dependent")
     default_ckpt = os.path.join(default_dir, "model_latest.pth")
 
     parser = argparse.ArgumentParser(
@@ -291,7 +295,7 @@ def main() -> None:
     device = select_device(args.device)
     model, metadata = load_model(args.checkpoint, device)
     bounds = tuple(metadata.get("bounds", (0.06, 15.53, -0.01, 9.16, -0.00, 3.13)))
-    t_max = float(metadata.get("t_max", 10.0))
+    t_max = float(metadata.get("t_max", 120.0))
 
     print(f"Domain bounds: X=[{bounds[0]:.2f}, {bounds[1]:.2f}], Y=[{bounds[2]:.2f}, {bounds[3]:.2f}], Z=[{bounds[4]:.2f}, {bounds[5]:.2f}]")
     print(f"Model physical time horizon: t ∈ [0.0, {t_max:.1f}] s")

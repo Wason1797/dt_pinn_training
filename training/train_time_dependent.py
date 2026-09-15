@@ -31,6 +31,9 @@ from physicsnemo.mesh.sampling import sample_random_points_on_cells
 from physicsnemo.models.mlp.fully_connected import FullyConnected
 from physicsnemo.utils.logging import PythonLogger
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+GEOM_DIR = os.path.join(REPO_ROOT, "geometries")
+
 
 def format_duration(seconds: float) -> str:
     """Format duration in seconds to a human-readable HH:MM:SS or MM:SS string."""
@@ -61,21 +64,37 @@ def compute_unsteady_pde_residuals(
     nu: float = 0.01,
     rho: float = 1.0,
     D: float = 0.005,
-    center: Tuple[float, float, float] = (0.0, 0.0, 0.0),
-    source_intensity: float = 10.0,
-    sigma: float = 0.2,
+    center: Tuple[float, float, float] = (7.79, 4.57, 1.10),
+    source_intensity: float = 0.00345,
+    sigma: float = 2.5,
 ) -> Dict[str, torch.Tensor]:
     """Compute unsteady 3D Navier-Stokes and pollutant transport residuals via autodiff.
 
-    Governing Equations:
-      Continuity:
-        div(u) = u_x + v_y + w_z = 0
-      Momentum:
-        u_t + (u·grad)u + (1/rho)*p_x - nu*laplace(u) = 0
-        v_t + (u·grad)v + (1/rho)*p_y - nu*laplace(v) = 0
-        w_t + (u·grad)w + (1/rho)*p_z - nu*laplace(w) = 0
-      Pollutant Transport:
-        c_t + (u·grad)c - D*laplace(c) - S(x, y, z) = 0
+    Governing Equations & Parameters:
+    --------------------------------
+    1. Incompressible Continuity:
+       res_continuity = ∂u/∂x + ∂v/∂y + ∂w/∂z = 0
+
+    2. Unsteady Navier-Stokes Momentum Equations:
+       res_mom_x = ∂u/∂t + (u·∇)u + (1/ρ) ∂p/∂x - ν ∇²u = 0
+       res_mom_y = ∂v/∂t + (u·∇)v + (1/ρ) ∂p/∂y - ν ∇²v = 0
+       res_mom_z = ∂w/∂t + (u·∇)w + (1/ρ) ∂p/∂z - ν ∇²w = 0
+       where:
+         - u, v, w: Fluid velocity components [m/s]
+         - p: Static pressure [Pa]
+         - ρ (rho): Fluid density [kg/m³] (default: 1.0 kg/m³)
+         - ν (nu): Kinematic viscosity of air [m²/s] (default: 0.01 m²/s)
+         - ∇²: Laplacian operator (∂²/∂x² + ∂²/∂y² + ∂²/∂z²)
+
+    3. Unsteady Pollutant Advection-Diffusion-Reaction Equation:
+       res_transport = ∂c/∂t + u·∇c - D ∇²c - S(x, y, z, t) = 0
+       where:
+         - c: Scalar concentration field [dimensionless]
+         - D: Molecular/turbulent pollutant diffusion coefficient [m²/s] (default: 0.005 m²/s)
+         - S(x, y, z): Gaussian continuous emission source [1/s]
+         - center (x0, y0, z0): Physical coordinates of the emission source [m]
+         - sigma: Gaussian spatial dispersion width [m] (default: 0.2 m)
+         - source_intensity: Peak emission rate S0 [1/s] (default: 10.0 s⁻¹)
     """
     u = out[:, 0:1]
     v = out[:, 1:2]
@@ -85,7 +104,7 @@ def compute_unsteady_pde_residuals(
 
     ones = torch.ones_like(u)
 
-    # 1. First temporal derivatives (local acceleration)
+    # 1. Temporal derivatives: ∂u/∂t, ∂v/∂t, ∂w/∂t, ∂c/∂t
     u_t = torch.autograd.grad(u, t, grad_outputs=ones, create_graph=True)[0]
     v_t = torch.autograd.grad(v, t, grad_outputs=ones, create_graph=True)[0]
     w_t = torch.autograd.grad(w, t, grad_outputs=ones, create_graph=True)[0]
@@ -146,7 +165,7 @@ def compute_unsteady_pde_residuals(
     }
 
 
-@hydra.main(version_base="1.3", config_path=".", config_name="config.yaml")
+@hydra.main(version_base="1.3", config_path="../", config_name="config.yaml")
 def room_trainer_time_dependent(cfg: DictConfig) -> None:
     # 1. Device Selection optimized for M-series Mac (MPS)
     if torch.backends.mps.is_available():
@@ -161,30 +180,31 @@ def room_trainer_time_dependent(cfg: DictConfig) -> None:
     log = PythonLogger(name="room_pollutant_unsteady")
     log.file_logging()
 
-    # Time parameters
-    t_max = float(getattr(cfg, "t_max", 10.0))
-    tau_ramp = 1.0  # Time constant for smooth inlet velocity ramp-up: v = -1.0 * tanh(3t / tau)
+    # Time parameters: Default 120 seconds
+    t_max = float(getattr(cfg, "t_max", 120.0))
+    tau_ramp = 2.0  # Smooth inlet velocity ramp-up time constant
 
     # Output directory formatted by date
     date_str = datetime.now().strftime("%Y-%m-%d")
-    output_dir = os.path.join("./outputs", date_str, "time_dependent")
+    output_dir = os.path.join(REPO_ROOT, "outputs", date_str, "time_dependent")
     os.makedirs(output_dir, exist_ok=True)
 
-    log.info("Loading STL geometries...")
-    volume_pv = pv.read("RoomVolume.stl")
-    walls_pv = pv.read("RoomVolume_Walls.stl")
-    windows_pv = pv.read("Windows.stl")
-    doors_pv = pv.read("Doors.stl")
+    log.info("Loading STL geometries from geometries/ ...")
+    volume_pv = pv.read(os.path.join(GEOM_DIR, "RoomVolume.stl"))
+    walls_pv = pv.read(os.path.join(GEOM_DIR, "RoomVolume_Walls.stl"))
+    windows_pv = pv.read(os.path.join(GEOM_DIR, "Windows.stl"))
+    doors_pv = pv.read(os.path.join(GEOM_DIR, "Doors.stl"))
 
     mesh_walls = from_pyvista(walls_pv)
     mesh_windows = from_pyvista(windows_pv)
     mesh_doors = from_pyvista(doors_pv)
 
     bounds = volume_pv.bounds
+    # Center of seating area at seated human breathing height (Z = 1.10 m)
     center = (
         (bounds[1] + bounds[0]) / 2.0,
         (bounds[3] + bounds[2]) / 2.0,
-        (bounds[5] + bounds[4]) / 2.0,
+        1.10,
     )
 
     # Precompute cell areas for uniform area-weighted surface sampling
@@ -214,19 +234,28 @@ def room_trainer_time_dependent(cfg: DictConfig) -> None:
     mask = enclosed["selected_points"].astype(bool)
     valid_interior_pts = raw_pts[mask]
 
-    # Exclude interior columns/pillars from fluid domain
-    split_vol = volume_pv.split_bodies()
-    for col_idx in range(2, len(split_vol)):
-        col_b = split_vol[col_idx].bounds
-        in_col = (
-            (valid_interior_pts[:, 0] >= col_b[0]) & (valid_interior_pts[:, 0] <= col_b[1])
-            & (valid_interior_pts[:, 1] >= col_b[2]) & (valid_interior_pts[:, 1] <= col_b[3])
-            & (valid_interior_pts[:, 2] >= col_b[4]) & (valid_interior_pts[:, 2] <= col_b[5])
+    # Exclude interior cylindrical columns/pillars from fluid domain
+    walls_bodies = walls_pv.split_bodies()
+    column_bodies = walls_bodies[1:5] if len(walls_bodies) >= 5 else walls_bodies[1:]
+    col_excluded_count = 0
+    for col_idx, col_mesh in enumerate(column_bodies, start=1):
+        cx, cy, cz = col_mesh.center
+        cb = col_mesh.bounds
+        radius = 0.285  # Conservative radius covering full cylinder
+        dist_sq = (valid_interior_pts[:, 0] - cx) ** 2 + (valid_interior_pts[:, 1] - cy) ** 2
+        in_cylinder = (
+            (dist_sq <= radius**2)
+            & (valid_interior_pts[:, 2] >= cb[4] - 0.01)
+            & (valid_interior_pts[:, 2] <= cb[5] + 0.01)
         )
-        valid_interior_pts = valid_interior_pts[~in_col]
+        col_excluded_count += int(np.sum(in_cylinder))
+        valid_interior_pts = valid_interior_pts[~in_cylinder]
 
+    log.info(
+        f"Excluded {col_excluded_count:,} points from inside {len(column_bodies)} cylindrical columns."
+    )
     interior_pool = torch.tensor(valid_interior_pts, dtype=torch.float32, device=device)
-    log.info(f"Interior point pool ready: {len(interior_pool):,} points inside watertight room.")
+    log.info(f"Interior point pool ready: {len(interior_pool):,} points inside watertight room (columns excluded).")
 
     def sample_interior_with_time(n_points):
         """Sample spatial interior points and time t, both requiring gradients."""
@@ -250,7 +279,7 @@ def room_trainer_time_dependent(cfg: DictConfig) -> None:
     optimizer = Adam(model.parameters(), lr=cfg.scheduler.initial_lr)
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: 0.99998717**step)
 
-    total_iters = getattr(cfg, "max_iters", 20000)
+    total_iters = getattr(cfg, "max_iters", 30000)
     log.info(f"Starting time-dependent PINN training for {total_iters:,} iterations (t ∈ [0, {t_max:.1f}]s)...")
     start_time = time.time()
     last_log_time = start_time
@@ -362,13 +391,13 @@ def room_trainer_time_dependent(cfg: DictConfig) -> None:
             with torch.no_grad():
                 res_grid = 35
                 grid_x, grid_y, grid_z = np.mgrid[
-                    bounds[0]:bounds[1]:complex(0, res_grid),
-                    bounds[2]:bounds[3]:complex(0, res_grid),
-                    bounds[4]:bounds[5]:complex(0, res_grid),
+                    bounds[0] : bounds[1] : complex(0, res_grid),
+                    bounds[2] : bounds[3] : complex(0, res_grid),
+                    bounds[4] : bounds[5] : complex(0, res_grid),
                 ]
                 grid_pts = np.vstack((grid_x.flatten(), grid_y.flatten(), grid_z.flatten())).T.astype(np.float32)
 
-                # Export physical time series snapshots (5 time points)
+                # Export physical time series snapshots (5 time points across 0 to t_max)
                 time_slices = np.linspace(0.0, t_max, 5)
                 pvd_entries = []
                 iter_dir = os.path.join(output_dir, f"snapshots_iter_{i:05d}")
@@ -387,7 +416,7 @@ def room_trainer_time_dependent(cfg: DictConfig) -> None:
                     vtu.point_data["pressure"] = preds[:, 3]
                     vtu.point_data["pollutant_c"] = preds[:, 4]
 
-                    vtu_name = f"time_{t_val:04.1f}s.vtu"
+                    vtu_name = f"time_{t_val:05.1f}s.vtu"
                     vtu.save(os.path.join(iter_dir, vtu_name))
                     pvd_entries.append((float(t_val), vtu_name))
 

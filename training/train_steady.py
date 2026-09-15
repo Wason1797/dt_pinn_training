@@ -11,6 +11,9 @@ import pyvista as pv
 from omegaconf import DictConfig
 from torch.optim import Adam, lr_scheduler
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+GEOM_DIR = os.path.join(REPO_ROOT, "geometries")
+
 
 def format_duration(seconds: float) -> str:
     """Format duration in seconds to a human-readable HH:MM:SS or MM:SS string."""
@@ -20,6 +23,7 @@ def format_duration(seconds: float) -> str:
     if h > 0:
         return f"{h:d}h {m:02d}m {s:02d}s"
     return f"{m:02d}m {s:02d}s"
+
 
 from sympy import Function, Number, Symbol, exp
 from physicsnemo.utils.logging import PythonLogger
@@ -31,52 +35,92 @@ from physicsnemo.mesh.io import from_pyvista
 
 
 class NavierStokesPollutant3D(PDE):
-    """Incompressible Navier-Stokes + Advection-Diffusion for Pollutant (steady, 3D)."""
+    """Incompressible Navier-Stokes + Advection-Diffusion for Pollutant (steady, 3D).
 
-    def __init__(self, nu=0.01, rho=1.0, D=0.005, center=(0.0, 0.0, 0.0)):
+    Governing Equations & Parameters:
+    --------------------------------
+    1. Continuity Equation (Mass conservation for incompressible fluid):
+       ∇ · u = ∂u/∂x + ∂v/∂y + ∂w/∂z = 0
+
+    2. Steady Momentum Equations (Navier-Stokes):
+       (u · ∇)u = -(1/ρ) ∇p + ν ∇²u
+       where:
+         - u, v, w: Fluid velocity components in X, Y, Z directions [m/s]
+         - p: Static pressure field [Pa] or [N/m²]
+         - ρ (rho): Fluid density (default: 1.0 kg/m³)
+         - ν (nu): Kinematic viscosity of air (default: 0.01 m²/s)
+
+    3. Pollutant Advection-Diffusion Equation:
+       u · ∇c = D ∇²c + S(x, y, z)
+       where:
+         - c: Pollutant scalar concentration [dimensionless or kg/m³]
+         - D: Molecular/turbulent mass diffusion coefficient (default: 0.005 m²/s)
+         - S: Continuous Gaussian source emission rate [1/s]
+         - center (x0, y0, z0): Physical 3D coordinates of source origin [m]
+         - sigma: Gaussian standard deviation / spatial spread of source (default: 0.2 m)
+         - source_intensity: Peak emission intensity S0 at source center (default: 10.0 s⁻¹)
+    """
+
+    def __init__(
+        self,
+        nu: float = 0.01,
+        rho: float = 1.0,
+        D: float = 0.005,
+        center: tuple = (7.79, 4.57, 1.10),
+        sigma: float = 2.5,
+        source_intensity: float = 0.00345,
+    ):
         self.dim = 3
         x, y, z = Symbol("x"), Symbol("y"), Symbol("z")
         iv = {"x": x, "y": y, "z": z}
-        
-        u = Function("u")(*iv.values())  # type: ignore
-        v = Function("v")(*iv.values())  # type: ignore
-        w = Function("w")(*iv.values())  # type: ignore
-        p = Function("p")(*iv.values())  # type: ignore
-        c = Function("c")(*iv.values())  # type: ignore
-        
-        nu, rho, D = Number(nu), Number(rho), Number(D)
-        
+
+        u = Function("u")(*iv.values())  # Velocity X [m/s]
+        v = Function("v")(*iv.values())  # Velocity Y [m/s]
+        w = Function("w")(*iv.values())  # Velocity Z [m/s]
+        p = Function("p")(*iv.values())  # Pressure [Pa]
+        c = Function("c")(*iv.values())  # Pollutant concentration
+
+        nu_sym, rho_sym, D_sym = Number(nu), Number(rho), Number(D)
+
         x0, y0, z0 = center
-        sigma = 0.2
-        source_intensity = 10.0
-        S = source_intensity * exp(-((x - x0)**2 + (y - y0)**2 + (z - z0)**2) / sigma**2)
-        
+        S = Number(source_intensity) * exp(
+            -((x - x0) ** 2 + (y - y0) ** 2 + (z - z0) ** 2) / Number(sigma) ** 2
+        )
+
         self.equations = {
             "continuity": u.diff(x) + v.diff(y) + w.diff(z),
             "momentum_x": (
-                u * u.diff(x) + v * u.diff(y) + w * u.diff(z)
-                + (1 / rho) * p.diff(x)
-                - nu * (u.diff(x, 2) + u.diff(y, 2) + u.diff(z, 2))
+                u * u.diff(x)
+                + v * u.diff(y)
+                + w * u.diff(z)
+                + (1 / rho_sym) * p.diff(x)
+                - nu_sym * (u.diff(x, 2) + u.diff(y, 2) + u.diff(z, 2))
             ),
             "momentum_y": (
-                u * v.diff(x) + v * v.diff(y) + w * v.diff(z)
-                + (1 / rho) * p.diff(y)
-                - nu * (v.diff(x, 2) + v.diff(y, 2) + v.diff(z, 2))
+                u * v.diff(x)
+                + v * v.diff(y)
+                + w * v.diff(z)
+                + (1 / rho_sym) * p.diff(y)
+                - nu_sym * (v.diff(x, 2) + v.diff(y, 2) + v.diff(z, 2))
             ),
             "momentum_z": (
-                u * w.diff(x) + v * w.diff(y) + w * w.diff(z)
-                + (1 / rho) * p.diff(z)
-                - nu * (w.diff(x, 2) + w.diff(y, 2) + w.diff(z, 2))
+                u * w.diff(x)
+                + v * w.diff(y)
+                + w * w.diff(z)
+                + (1 / rho_sym) * p.diff(z)
+                - nu_sym * (w.diff(x, 2) + w.diff(y, 2) + w.diff(z, 2))
             ),
             "transport": (
-                u * c.diff(x) + v * c.diff(y) + w * c.diff(z)
-                - D * (c.diff(x, 2) + c.diff(y, 2) + c.diff(z, 2))
+                u * c.diff(x)
+                + v * c.diff(y)
+                + w * c.diff(z)
+                - D_sym * (c.diff(x, 2) + c.diff(y, 2) + c.diff(z, 2))
                 - S
-            )
+            ),
         }
 
 
-@hydra.main(version_base="1.3", config_path=".", config_name="config.yaml")
+@hydra.main(version_base="1.3", config_path="../", config_name="config.yaml")
 def room_trainer(cfg: DictConfig) -> None:
     # 1. Device Selection optimized for M-series Mac (MPS)
     if torch.backends.mps.is_available():
@@ -93,25 +137,25 @@ def room_trainer(cfg: DictConfig) -> None:
 
     # Output directory formatted by date: ./outputs/YYYY-MM-DD
     date_str = datetime.now().strftime("%Y-%m-%d")
-    output_dir = os.path.join("./outputs", date_str)
+    output_dir = os.path.join(REPO_ROOT, "outputs", date_str)
     os.makedirs(output_dir, exist_ok=True)
 
-    log.info("Loading STL geometries...")
-    volume_pv = pv.read("RoomVolume.stl")
-    walls_pv = pv.read("RoomVolume_Walls.stl")
-    windows_pv = pv.read("Windows.stl")
-    doors_pv = pv.read("Doors.stl")
+    log.info("Loading STL geometries from geometries/ ...")
+    volume_pv = pv.read(os.path.join(GEOM_DIR, "RoomVolume.stl"))
+    walls_pv = pv.read(os.path.join(GEOM_DIR, "RoomVolume_Walls.stl"))
+    windows_pv = pv.read(os.path.join(GEOM_DIR, "Windows.stl"))
+    doors_pv = pv.read(os.path.join(GEOM_DIR, "Doors.stl"))
 
-    mesh_volume = from_pyvista(volume_pv)
     mesh_walls = from_pyvista(walls_pv)
     mesh_windows = from_pyvista(windows_pv)
     mesh_doors = from_pyvista(doors_pv)
 
     bounds = volume_pv.bounds
+    # Center of seating area at seated human breathing height (Z = 1.10 m)
     center = (
         (bounds[1] + bounds[0]) / 2.0,
         (bounds[3] + bounds[2]) / 2.0,
-        (bounds[5] + bounds[4]) / 2.0
+        1.10,
     )
 
     # Precompute cell areas for uniform area-weighted surface sampling
@@ -120,7 +164,6 @@ def room_trainer(cfg: DictConfig) -> None:
     windows_areas = torch.tensor(windows_pv.compute_cell_sizes().cell_data["Area"], dtype=torch.float32)
 
     def sample_surface(surface_mesh, areas, n_points, current_device):
-        # Sample cells weighted by actual surface area
         cell_indices = torch.multinomial(areas, n_points, replacement=True).to(current_device)
         pts = sample_random_points_on_cells(surface_mesh, cell_indices)
         return pts.to(device=current_device, dtype=torch.float32)
@@ -130,28 +173,36 @@ def room_trainer(cfg: DictConfig) -> None:
     raw_pts = np.random.uniform(
         [bounds[0], bounds[2], bounds[4]],
         [bounds[1], bounds[3], bounds[5]],
-        size=(200000, 3)
+        size=(200000, 3),
     )
     cloud = pv.PolyData(raw_pts)
-    # Use the main room enclosure
     body1 = volume_pv.split_bodies()[1].extract_surface(algorithm="dataset_surface")
     enclosed = cloud.select_interior_points(body1, check_surface=False)
     mask = enclosed["selected_points"].astype(bool)
     valid_interior_pts = raw_pts[mask]
 
-    # Exclude interior columns/pillars from the fluid domain
-    split_vol = volume_pv.split_bodies()
-    for col_idx in range(2, len(split_vol)):
-        col_b = split_vol[col_idx].bounds
-        in_col = (
-            (valid_interior_pts[:, 0] >= col_b[0]) & (valid_interior_pts[:, 0] <= col_b[1]) &
-            (valid_interior_pts[:, 1] >= col_b[2]) & (valid_interior_pts[:, 1] <= col_b[3]) &
-            (valid_interior_pts[:, 2] >= col_b[4]) & (valid_interior_pts[:, 2] <= col_b[5])
+    # Exclude interior cylindrical columns/pillars from the fluid domain
+    walls_bodies = walls_pv.split_bodies()
+    column_bodies = walls_bodies[1:5] if len(walls_bodies) >= 5 else walls_bodies[1:]
+    col_excluded_count = 0
+    for col_idx, col_mesh in enumerate(column_bodies, start=1):
+        cx, cy, cz = col_mesh.center
+        cb = col_mesh.bounds
+        radius = 0.285  # Conservative radius covering full cylinder
+        dist_sq = (valid_interior_pts[:, 0] - cx) ** 2 + (valid_interior_pts[:, 1] - cy) ** 2
+        in_cylinder = (
+            (dist_sq <= radius**2)
+            & (valid_interior_pts[:, 2] >= cb[4] - 0.01)
+            & (valid_interior_pts[:, 2] <= cb[5] + 0.01)
         )
-        valid_interior_pts = valid_interior_pts[~in_col]
+        col_excluded_count += int(np.sum(in_cylinder))
+        valid_interior_pts = valid_interior_pts[~in_cylinder]
 
+    log.info(
+        f"Excluded {col_excluded_count:,} points from inside {len(column_bodies)} cylindrical columns."
+    )
     interior_pool = torch.tensor(valid_interior_pts, dtype=torch.float32, device=device)
-    log.info(f"Interior point pool ready: {len(interior_pool):,} points inside watertight room.")
+    log.info(f"Interior point pool ready: {len(interior_pool):,} points inside watertight room (columns excluded).")
 
     def sample_interior(n_points):
         idx = torch.randint(0, len(interior_pool), (n_points,), device=device)
@@ -172,8 +223,8 @@ def room_trainer(cfg: DictConfig) -> None:
     optimizer = Adam(model.parameters(), lr=cfg.scheduler.initial_lr)
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: 0.99998717**step)
 
-    total_iters = 20000
-    log.info(f"Starting training for {total_iters:,} iterations...")
+    total_iters = getattr(cfg, "max_iters", 30000)
+    log.info(f"Starting steady-state training for {total_iters:,} iterations...")
     start_time = time.time()
     last_log_time = start_time
     last_log_iter = 0
@@ -192,17 +243,17 @@ def room_trainer(cfg: DictConfig) -> None:
         out_interior = model(pts_interior)
 
         # 1. Walls: No-slip (u=0, v=0, w=0)
-        loss_walls = torch.mean(out_walls[:, 0:3]**2) 
+        loss_walls = torch.mean(out_walls[:, 0:3] ** 2)
 
-        # 2. Windows (Inlet at Y≈9): Inflow into room towards negative Y (v = -1.0, u = 0, w = 0), Clean air (c=0)
-        loss_windows_u = torch.mean(out_windows[:, 0]**2)
-        loss_windows_v = torch.mean((out_windows[:, 1] + 1.0)**2)  # Inflow in -Y direction
-        loss_windows_w = torch.mean(out_windows[:, 2]**2)
-        loss_windows_c = torch.mean(out_windows[:, 4]**2) 
+        # 2. Windows (Inlet at Y≈9): Inflow towards negative Y (v = -1.0, u = 0, w = 0), Clean air (c=0)
+        loss_windows_u = torch.mean(out_windows[:, 0] ** 2)
+        loss_windows_v = torch.mean((out_windows[:, 1] + 1.0) ** 2)
+        loss_windows_w = torch.mean(out_windows[:, 2] ** 2)
+        loss_windows_c = torch.mean(out_windows[:, 4] ** 2)
         loss_windows = loss_windows_u + loss_windows_v + loss_windows_w + loss_windows_c
 
-        # 3. Doors (Outlet at Y≈0): Zero pressure (p=0) allows air to naturally exit
-        loss_doors = torch.mean(out_doors[:, 3]**2)
+        # 3. Doors (Outlet at Y≈0): Zero pressure (p=0)
+        loss_doors = torch.mean(out_doors[:, 3] ** 2)
 
         phy_loss_dict = phy_inf.forward(
             {
@@ -219,11 +270,11 @@ def room_trainer(cfg: DictConfig) -> None:
         )
 
         loss_phy = (
-            torch.mean(phy_loss_dict["continuity"]**2) +
-            torch.mean(phy_loss_dict["momentum_x"]**2) +
-            torch.mean(phy_loss_dict["momentum_y"]**2) +
-            torch.mean(phy_loss_dict["momentum_z"]**2) +
-            torch.mean(phy_loss_dict["transport"]**2)
+            torch.mean(phy_loss_dict["continuity"] ** 2)
+            + torch.mean(phy_loss_dict["momentum_x"] ** 2)
+            + torch.mean(phy_loss_dict["momentum_y"] ** 2)
+            + torch.mean(phy_loss_dict["momentum_z"] ** 2)
+            + torch.mean(phy_loss_dict["transport"] ** 2)
         )
 
         total_loss = loss_phy + loss_walls + loss_doors + loss_windows
@@ -231,7 +282,6 @@ def room_trainer(cfg: DictConfig) -> None:
         optimizer.step()
         scheduler.step()
 
-        # Regular progress logging every 10 iterations (~20s on Apple Silicon)
         if i % 10 == 0 and i > 0 and i % 1000 != 0:
             now = time.time()
             elapsed = now - start_time
@@ -249,7 +299,6 @@ def room_trainer(cfg: DictConfig) -> None:
                 f"ETA: {format_duration(eta_seconds)}"
             )
 
-        # Checkpoint and detailed progress every 1000 iterations (and step 0)
         if i % 1000 == 0:
             now = time.time()
             elapsed = now - start_time
@@ -269,19 +318,20 @@ def room_trainer(cfg: DictConfig) -> None:
             )
             last_log_time = now
             last_log_iter = i
-            
+
             with torch.no_grad():
                 grid_x, grid_y, grid_z = np.mgrid[
-                    bounds[0]:bounds[1]:50j, 
-                    bounds[2]:bounds[3]:50j, 
-                    bounds[4]:bounds[5]:50j
+                    bounds[0] : bounds[1] : 50j,
+                    bounds[2] : bounds[3] : 50j,
+                    bounds[4] : bounds[5] : 50j,
                 ]
-                # Cast to float32 to prevent MPS backend errors
-                grid_pts = np.vstack((grid_x.flatten(), grid_y.flatten(), grid_z.flatten())).T.astype(np.float32)
+                grid_pts = np.vstack(
+                    (grid_x.flatten(), grid_y.flatten(), grid_z.flatten())
+                ).T.astype(np.float32)
                 grid_tensor = torch.tensor(grid_pts, dtype=torch.float32, device=device)
-                
+
                 preds = model(grid_tensor).cpu().numpy()
-                
+
                 vtu = pv.PolyData(grid_pts).cast_to_unstructured_grid()
                 vtu.point_data["velocity_u"] = preds[:, 0]
                 vtu.point_data["velocity_v"] = preds[:, 1]
@@ -289,10 +339,9 @@ def room_trainer(cfg: DictConfig) -> None:
                 vtu.point_data["velocity_mag"] = np.linalg.norm(preds[:, 0:3], axis=1)
                 vtu.point_data["pressure"] = preds[:, 3]
                 vtu.point_data["pollutant_c"] = preds[:, 4]
-                
+
                 vtu.save(os.path.join(output_dir, f"room_inference_{i:05d}.vtu"))
 
-                # Save periodic checkpoint
                 checkpoint_data = {
                     "iteration": i,
                     "model_state_dict": model.state_dict(),
@@ -308,11 +357,10 @@ def room_trainer(cfg: DictConfig) -> None:
                 }
                 torch.save(checkpoint_data, os.path.join(output_dir, f"model_checkpoint_{i:05d}.pth"))
                 torch.save(checkpoint_data, os.path.join(output_dir, "model_latest.pth"))
-                torch.save(checkpoint_data, "./outputs/model_latest.pth")
+                torch.save(checkpoint_data, os.path.join(REPO_ROOT, "outputs", "model_latest.pth"))
 
-    # Save final model
     final_checkpoint = {
-        "iteration": 20000,
+        "iteration": total_iters,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "bounds": bounds,
@@ -327,7 +375,10 @@ def room_trainer(cfg: DictConfig) -> None:
     torch.save(final_checkpoint, os.path.join(output_dir, "model_final.pth"))
     torch.save(final_checkpoint, os.path.join(output_dir, "model_latest.pth"))
     total_time = time.time() - start_time
-    log.info(f"Training complete in {format_duration(total_time)}! Saved final model to {os.path.join(output_dir, 'model_final.pth')}")
+    log.info(
+        f"Training complete in {format_duration(total_time)}! Saved final model to {os.path.join(output_dir, 'model_final.pth')}"
+    )
+
 
 if __name__ == "__main__":
     room_trainer()

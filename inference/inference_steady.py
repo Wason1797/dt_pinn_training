@@ -18,6 +18,10 @@ import torch
 
 from physicsnemo.models.mlp.fully_connected import FullyConnected
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+GEOM_DIR = os.path.join(REPO_ROOT, "geometries")
+OUTPUT_DIR = os.path.join(REPO_ROOT, "outputs")
+
 
 def select_device(requested_device: str = "auto") -> torch.device:
     """Select the most optimal hardware device available."""
@@ -401,11 +405,11 @@ def plot_2d_slices(
 
 def main() -> None:
     date_str = datetime.now().strftime("%Y-%m-%d")
-    date_dir = os.path.join("./outputs", date_str)
+    date_dir = os.path.join(OUTPUT_DIR, date_str)
 
     # Find the most relevant default checkpoint
     date_ckpt = os.path.join(date_dir, "model_latest.pth")
-    root_ckpt = "./outputs/model_latest.pth"
+    root_ckpt = os.path.join(OUTPUT_DIR, "model_latest.pth")
     default_ckpt = date_ckpt if os.path.exists(date_ckpt) else root_ckpt
 
     parser = argparse.ArgumentParser(
@@ -443,7 +447,7 @@ def main() -> None:
     parser.add_argument(
         "--stl",
         type=str,
-        default="RoomVolume.stl",
+        default=os.path.join(GEOM_DIR, "RoomVolume.stl"),
         help="Path to RoomVolume STL to determine domain bounds.",
     )
     parser.add_argument(

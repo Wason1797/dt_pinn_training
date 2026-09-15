@@ -19,6 +19,10 @@ import time
 
 from paraview.simple import *
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+GEOM_DIR = os.path.join(REPO_ROOT, "geometries")
+OUTPUT_DIR = os.path.join(REPO_ROOT, "animation_renders")
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -45,6 +49,8 @@ ANIMATION_SUBDIRS = {
     "convergence": "convergence",
     "streamlines": "streamlines",
     "sweep": "sweep",
+    "timelapse": "timelapse",
+    "particles": "particles",
 }
 
 
@@ -571,7 +577,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--type",
-        choices=["convergence", "streamlines", "sweep", "all"],
+        choices=["convergence", "streamlines", "sweep", "timelapse", "particles", "all"],
         default="all",
         help="Animation type to render (default: all)",
     )
@@ -583,12 +589,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--input-dir",
         default=None,
-        help="Directory containing animation subdirs (convergence/, streamlines/, sweep/)",
+        help="Directory containing animation subdirs (convergence/, streamlines/, sweep/, timelapse/, particles/)",
     )
     parser.add_argument(
         "--output-dir",
-        default="./animation_renders/",
-        help="Output directory for rendered frames (default: ./animation_renders/)",
+        default=OUTPUT_DIR,
+        help=f"Output directory for rendered frames (default: {OUTPUT_DIR})",
     )
     parser.add_argument(
         "--format",
@@ -609,8 +615,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--stl",
-        default="RoomVolume_Walls.stl",
-        help="Room geometry STL for wireframe overlay (default: RoomVolume_Walls.stl)",
+        default=os.path.join(GEOM_DIR, "RoomVolume_Walls.stl"),
+        help="Room geometry STL for wireframe overlay (default: geometries/RoomVolume_Walls.stl)",
     )
     parser.add_argument(
         "--no-stl",
@@ -651,15 +657,12 @@ def main() -> None:
     if args.type == "all":
         if not args.input_dir:
             parser.error("--input-dir is required when --type is 'all'")
-        for atype in ("convergence", "streamlines", "sweep"):
+        for atype in ("convergence", "streamlines", "sweep", "timelapse", "particles"):
             pvd = find_pvd_file(args.input_dir, atype)
             if pvd:
                 render_jobs.append((atype, pvd))
-            else:
-                print(f"  [WARN] No PVD file found for '{atype}' in {args.input_dir}")
     else:
         if not args.input:
-            # Try to auto-discover from --input-dir
             if args.input_dir:
                 pvd = find_pvd_file(args.input_dir, args.type)
                 if pvd:
@@ -694,6 +697,8 @@ def main() -> None:
         "convergence": render_convergence,
         "streamlines": render_streamlines,
         "sweep": render_sweep,
+        "timelapse": render_convergence,
+        "particles": render_streamlines,
     }
 
     t_total = time.time()
