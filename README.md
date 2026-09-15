@@ -17,11 +17,13 @@ pinn_training/
 │   ├── train_steady.py             # 3D Steady Navier-Stokes + pollutant (30k iters)
 │   ├── train_time_dependent.py     # 4D (x,y,z,t) Unsteady PINN (T_max=120s, 30k iters)
 │   ├── finetune_initial_velocity.py# Fine-tune checkpoint for custom IC (u0, v0, w0)
-│   └── train_parametric.py         # 5D (x,y,z,t,V_inlet) Parametric PINN (120s, 30k iters)
+│   ├── train_parametric.py         # 5D (x,y,z,t,V_inlet) Parametric PINN (120s, 30k iters)
+│   └── train_parametric_occupancy.py # 6D (x,y,z,t,V_inlet,N_people) Parametric PINN
 ├── inference/                      # Forward evaluation & visualization exporters
 │   ├── inference_steady.py         # Steady-state field, streamline & sweep exporter
 │   ├── inference_time_dependent.py # Physical time-lapse & unsteady pathline exporter (120s)
-│   └── inference_parametric.py     # Real-time query for arbitrary V_inlet (0.2 - 2.5 m/s)
+│   ├── inference_parametric.py     # Real-time query for arbitrary V_inlet (0.2 - 2.5 m/s)
+│   └── inference_parametric_occupancy.py # Real-time query for arbitrary V_inlet & N_people
 ├── rendering/                      # Headless visualization & video rendering
 │   └── paraview_animate.py         # ParaView / pvpython batch animation renderer
 ├── outputs/                        # Checkpoints (.pth), snapshots (.vtu), and collections (.pvd)
@@ -121,6 +123,16 @@ $$\begin{aligned}
 
 ---
 
+#### 1.5 6D Parametric PINN with Occupancy ($V_{\text{inlet}} \in [0.2,\, 2.5]\,\text{m/s},\; N_{\text{people}} \in [0,\, 50]$)
+*Trains a 6D surrogate model predicting airflow and $\text{CO}_2$ concentration for any velocity and any occupant count.*
+```bash
+.venv/bin/python training/train_parametric_occupancy.py
+```
+- **What it does:** Trains a 6D MLP $(x, y, z, t, V_{\text{inlet}}, N_{\text{people}}) \to (u, v, w, p, c)$ where the $\text{CO}_2$ source rate scales directly with the number of people ($S_0 = N_{\text{people}} \times 1.15 \times 10^{-4}\,\text{g}/(\text{m}^3\cdot\text{s})$).
+- **Outputs:** Saves `outputs/YYYY-MM-DD/parametric_occupancy/model_final.pth`.
+
+---
+
 ### Step 2: Inference & Animation Generation
 
 The inference scripts evaluate the neural network over 3D spatial grids and particle systems, generating `.vtu` and `.pvd` collections.
@@ -164,7 +176,7 @@ The inference scripts evaluate the neural network over 3D spatial grids and part
 
 ---
 
-#### 2.2 Generating Parametric Visualizations ([inference_parametric.py](file:///Users/wb/Documents/Personal/FUAS/8_Thesis/code/pinn_training/inference/inference_parametric.py))
+#### 2.2 Generating 5D Parametric Visualizations ([inference_parametric.py](file:///Users/wb/Documents/Personal/FUAS/8_Thesis/code/pinn_training/inference/inference_parametric.py))
 
 ```bash
 # 1. Probe for V_inlet = 1.5 m/s at t = 20s
@@ -190,6 +202,35 @@ The inference scripts evaluate the neural network over 3D spatial grids and part
 >   - `--velocity 1.8` $\longrightarrow$ outputs to `v_1.80/` (moderate ventilation)
 >   - `--velocity 2.5` $\longrightarrow$ outputs to `v_2.50/` (strong ventilation)
 > - This allows you to compare multiple ventilation conditions side-by-side in ParaView using the exact same trained neural network without retraining.
+
+---
+
+#### 2.3 Generating 6D Parametric Occupancy Visualizations ([inference_parametric_occupancy.py](file:///Users/wb/Documents/Personal/FUAS/8_Thesis/code/pinn_training/inference/inference_parametric_occupancy.py))
+
+```bash
+# 1. Probe point (x=7.0, y=4.5, z=1.1) at t=30s for V_inlet = 1.5 m/s and N_people = 30
+.venv/bin/python inference/inference_parametric_occupancy.py \
+  --checkpoint outputs/2026-09-15/parametric_occupancy/model_final.pth \
+  --probe 7.0 4.5 1.1 30.0 1.5 30.0
+
+# 2. Export physical time-lapse for V_inlet = 1.2 m/s with N_people = 25 occupants
+.venv/bin/python inference/inference_parametric_occupancy.py \
+  --checkpoint outputs/2026-09-15/parametric_occupancy/model_final.pth \
+  --velocity 1.2 \
+  --occupancy 25.0 \
+  --animate timelapse \
+  --frames 60 \
+  --resolution 40 \
+  --output-dir outputs/2026-09-15/parametric_occupancy/animations
+
+# 3. Export Occupancy Comparison Sweep comparing N_people = [0, 10, 20, 30, 40, 50]
+.venv/bin/python inference/inference_parametric_occupancy.py \
+  --checkpoint outputs/2026-09-15/parametric_occupancy/model_final.pth \
+  --velocity 1.5 \
+  --animate occupancy_sweep \
+  --resolution 40 \
+  --output-dir outputs/2026-09-15/parametric_occupancy/animations
+```
 
 ---
 
