@@ -36,6 +36,14 @@ from physicsnemo.mesh.sampling import sample_random_points_on_cells
 from physicsnemo.models.mlp.fully_connected import FullyConnected
 from physicsnemo.utils.logging import PythonLogger
 from training.checkpoint_utils import load_checkpoint_for_training, save_training_checkpoint
+from training.geometry_utils import (
+    extract_room_domain,
+    split_walls_and_obstacles,
+    exclude_obstacle_volumes,
+    verify_flow_direction,
+    decompose_windows,
+    find_seated_breathing_center,
+)
 
 
 def format_duration(seconds: float) -> str:
@@ -175,12 +183,11 @@ def room_trainer_parametric_multi_window(cfg: DictConfig) -> None:
     windows_pv = pv.read(os.path.join(GEOM_DIR, "Windows.stl"))
     doors_pv = pv.read(os.path.join(GEOM_DIR, "Doors.stl"))
 
-    mesh_walls = from_pyvista(walls_pv)
-    mesh_doors = from_pyvista(doors_pv)
+    # Verify physical flow direction: Windows -> Doors along -Y
+    verify_flow_direction(windows_pv, doors_pv)
 
-    # Split Windows.stl into 8 individual window bodies sorted along the X axis
-    window_bodies = sorted(windows_pv.split_bodies(), key=lambda b: b.center[0])
-    num_windows = len(window_bodies)
+    # Decompose windows and detect window count
+    window_bodies, num_windows = decompose_windows(windows_pv)
     log.info(f"Loaded {num_windows} individual window bodies from Windows.stl (sorted West->East along X):")
     mesh_windows = []
     windows_areas = []
@@ -192,18 +199,19 @@ def room_trainer_parametric_multi_window(cfg: DictConfig) -> None:
         mesh_windows.append(from_pyvista(body))
         windows_areas.append(torch.tensor(body.compute_cell_sizes().cell_data["Area"], dtype=torch.float32))
 
+    # Identify outer walls and any internal obstacle bodies (columns + furniture)
+    walls_pv, obstacle_bodies = split_walls_and_obstacles(walls_pv, geom_dir=GEOM_DIR)
+    mesh_walls = from_pyvista(walls_pv)
+    mesh_doors = from_pyvista(doors_pv)
+
     bounds = volume_pv.bounds
-    center = (
-        (bounds[1] + bounds[0]) / 2.0,
-        (bounds[3] + bounds[2]) / 2.0,
-        1.10,
-    )
+    center = find_seated_breathing_center(volume_pv, breathing_height=1.10)
 
     walls_areas = torch.tensor(walls_pv.compute_cell_sizes().cell_data["Area"], dtype=torch.float32)
     doors_areas = torch.tensor(doors_pv.compute_cell_sizes().cell_data["Area"], dtype=torch.float32)
 
     def sample_surface_13d(surface_mesh, areas, n_points, current_device):
-        """Sample spatial boundary points with random t, 8D V_inlet, and N_people."""
+        """Sample spatial boundary points with random t, multi-window velocities, and N_people."""
         cell_indices = torch.multinomial(areas, n_points, replacement=True).to(current_device)
         pts = sample_random_points_on_cells(surface_mesh, cell_indices).to(
             device=current_device, dtype=torch.float32
@@ -214,7 +222,7 @@ def room_trainer_parametric_multi_window(cfg: DictConfig) -> None:
         return torch.cat([pts, t, v_param, n_param], dim=1)
 
     def sample_windows_13d(n_points_per_window: int = 150):
-        """Sample boundary points across all 8 windows and compute corresponding target velocities."""
+        """Sample boundary points across all windows and compute corresponding target velocities towards doors (-Y)."""
         inps: List[torch.Tensor] = []
         v_targets: List[torch.Tensor] = []
 
@@ -229,7 +237,7 @@ def room_trainer_parametric_multi_window(cfg: DictConfig) -> None:
             v_param_k = v_min + torch.rand(n_points_per_window, num_windows, device=device, dtype=torch.float32) * (v_max - v_min)
             n_param_k = n_people_min + torch.rand(n_points_per_window, 1, device=device, dtype=torch.float32) * (n_people_max - n_people_min)
 
-            # Target velocity for Window k: inflow towards negative Y governed by its specific velocity V_k
+            # Target velocity for Window k: inflow towards negative Y (doors) governed by its specific velocity V_k
             v_k = v_param_k[:, k : k + 1]
             v_target_k = -v_k * torch.tanh(3.0 * t_k / tau_ramp)
 
@@ -245,36 +253,21 @@ def room_trainer_parametric_multi_window(cfg: DictConfig) -> None:
         size=(200000, 3),
     )
     cloud = pv.PolyData(raw_pts)
-    body1 = volume_pv.split_bodies()[1].extract_surface(algorithm="dataset_surface")
-    enclosed = cloud.select_interior_points(body1, check_surface=False)
+    watertight_domain = extract_room_domain(volume_pv)
+    enclosed = cloud.select_interior_points(watertight_domain, check_surface=False)
     mask = enclosed["selected_points"].astype(bool)
     valid_interior_pts = raw_pts[mask]
 
-    # Exclude interior cylindrical columns/pillars from fluid domain
-    walls_bodies = walls_pv.split_bodies()
-    column_bodies = walls_bodies[1:5] if len(walls_bodies) >= 5 else walls_bodies[1:]
-    col_excluded_count = 0
-    for col_idx, col_mesh in enumerate(column_bodies, start=1):
-        cx, cy, cz = col_mesh.center
-        cb = col_mesh.bounds
-        radius = 0.285
-        dist_sq = (valid_interior_pts[:, 0] - cx) ** 2 + (valid_interior_pts[:, 1] - cy) ** 2
-        in_cylinder = (
-            (dist_sq <= radius**2)
-            & (valid_interior_pts[:, 2] >= cb[4] - 0.01)
-            & (valid_interior_pts[:, 2] <= cb[5] + 0.01)
-        )
-        col_excluded_count += int(np.sum(in_cylinder))
-        valid_interior_pts = valid_interior_pts[~in_cylinder]
-
+    # Exclude interior columns and any internal obstacles from fluid domain
+    valid_interior_pts, col_excluded_count = exclude_obstacle_volumes(valid_interior_pts, obstacle_bodies)
     log.info(
-        f"Excluded {col_excluded_count:,} points from inside {len(column_bodies)} cylindrical columns."
+        f"Excluded {col_excluded_count:,} points from inside {len(obstacle_bodies)} internal obstacles/columns."
     )
     interior_pool = torch.tensor(valid_interior_pts, dtype=torch.float32, device=device)
-    log.info(f"Interior point pool ready: {len(interior_pool):,} points inside watertight room (columns excluded).")
+    log.info(f"Interior point pool ready: {len(interior_pool):,} points inside watertight room (obstacles excluded).")
 
     def sample_interior_13d(n_points):
-        """Sample (x, y, z), t, 8D window velocities, and N_people."""
+        """Sample (x, y, z), t, window velocities, and N_people."""
         idx = torch.randint(0, len(interior_pool), (n_points,), device=device)
         coords = interior_pool[idx].clone().requires_grad_(True)
         t = (torch.rand(n_points, 1, device=device, dtype=torch.float32) * t_max).requires_grad_(True)
@@ -283,7 +276,7 @@ def room_trainer_parametric_multi_window(cfg: DictConfig) -> None:
         return coords, t, v_param, n_param
 
     def sample_initial_condition_13d(n_points):
-        """Sample points at t = 0 with random 8D window velocities and N_people."""
+        """Sample points at t = 0 with random window velocities and N_people."""
         idx = torch.randint(0, len(interior_pool), (n_points,), device=device)
         coords = interior_pool[idx].clone()
         t_zero = torch.zeros(n_points, 1, device=device, dtype=torch.float32)
@@ -291,9 +284,10 @@ def room_trainer_parametric_multi_window(cfg: DictConfig) -> None:
         n_param = n_people_min + torch.rand(n_points, 1, device=device, dtype=torch.float32) * (n_people_max - n_people_min)
         return torch.cat([coords, t_zero, v_param, n_param], dim=1)
 
-    # 13D Model: (x, y, z, t, V_1, ..., V_8, N_people) -> (u, v, w, p, c)
+    # Dynamic Multi-Window Model: (x, y, z, t, V_1, ..., V_N, N_people) -> (u, v, w, p, c)
+    in_features = 3 + 1 + num_windows + 1
     model = FullyConnected(
-        in_features=13, out_features=5, num_layers=6, layer_size=512
+        in_features=in_features, out_features=5, num_layers=6, layer_size=512
     ).to(device)
 
     optimizer = Adam(model.parameters(), lr=cfg.scheduler.initial_lr)
@@ -312,7 +306,7 @@ def room_trainer_parametric_multi_window(cfg: DictConfig) -> None:
             scheduler=scheduler,
             device=device,
             resume=True,
-            expected_in_features=13,
+            expected_in_features=in_features,
             expected_out_features=5,
         )
     elif checkpoint_path:
@@ -323,7 +317,7 @@ def room_trainer_parametric_multi_window(cfg: DictConfig) -> None:
             scheduler=scheduler,
             device=device,
             resume=False,
-            expected_in_features=13,
+            expected_in_features=in_features,
             expected_out_features=5,
         )
 
@@ -454,7 +448,13 @@ def room_trainer_parametric_multi_window(cfg: DictConfig) -> None:
                 os.makedirs(iter_dir, exist_ok=True)
 
                 # Validation scenario: Asymmetric cross-ventilation
-                v_nom = np.array([1.5, 0.0, 0.0, 1.2, 0.0, 0.0, 0.0, 1.5], dtype=np.float32)
+                v_nom = np.zeros(num_windows, dtype=np.float32)
+                if num_windows >= 1:
+                    v_nom[0] = 1.5
+                if num_windows >= 4:
+                    v_nom[3] = 1.2
+                if num_windows >= 8:
+                    v_nom[7] = 1.5
                 n_nom = 30.0
                 for t_val in time_slices:
                     t_col = np.full((grid_pts.shape[0], 1), fill_value=t_val, dtype=np.float32)
@@ -492,7 +492,7 @@ def room_trainer_parametric_multi_window(cfg: DictConfig) -> None:
                 "n_people_min": n_people_min,
                 "n_people_max": n_people_max,
                 "model_config": {
-                    "in_features": 13,
+                    "in_features": in_features,
                     "out_features": 5,
                     "num_layers": 6,
                     "layer_size": 512,
@@ -527,7 +527,7 @@ def room_trainer_parametric_multi_window(cfg: DictConfig) -> None:
         "n_people_min": n_people_min,
         "n_people_max": n_people_max,
         "model_config": {
-            "in_features": 13,
+            "in_features": in_features,
             "out_features": 5,
             "num_layers": 6,
             "layer_size": 512,

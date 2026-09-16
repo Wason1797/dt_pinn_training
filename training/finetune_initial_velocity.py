@@ -23,6 +23,13 @@ from physicsnemo.mesh.io import from_pyvista
 from physicsnemo.mesh.sampling import sample_random_points_on_cells
 from physicsnemo.models.mlp.fully_connected import FullyConnected
 from training.checkpoint_utils import load_checkpoint_for_training, save_training_checkpoint
+from training.geometry_utils import (
+    extract_room_domain,
+    split_walls_and_obstacles,
+    exclude_obstacle_volumes,
+    verify_flow_direction,
+    find_seated_breathing_center,
+)
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 GEOM_DIR = os.path.join(REPO_ROOT, "geometries")
@@ -258,16 +265,17 @@ def main() -> None:
     windows_pv = pv.read(os.path.join(GEOM_DIR, "Windows.stl"))
     doors_pv = pv.read(os.path.join(GEOM_DIR, "Doors.stl"))
 
+    # Verify physical flow direction: Windows -> Doors along -Y
+    verify_flow_direction(windows_pv, doors_pv)
+
+    # Identify outer walls and internal obstacles (columns + furniture)
+    walls_pv, obstacle_bodies = split_walls_and_obstacles(walls_pv, geom_dir=GEOM_DIR)
     mesh_walls = from_pyvista(walls_pv)
     mesh_windows = from_pyvista(windows_pv)
     mesh_doors = from_pyvista(doors_pv)
 
     bounds = tuple(ckpt.get("bounds", volume_pv.bounds))
-    center = tuple(ckpt.get("center", (
-        (bounds[1] + bounds[0]) / 2.0,
-        (bounds[3] + bounds[2]) / 2.0,
-        1.10,
-    )))
+    center = tuple(ckpt.get("center", find_seated_breathing_center(volume_pv, breathing_height=1.10)))
 
     walls_areas = torch.tensor(walls_pv.compute_cell_sizes().cell_data["Area"], dtype=torch.float32)
     doors_areas = torch.tensor(doors_pv.compute_cell_sizes().cell_data["Area"], dtype=torch.float32)
@@ -287,29 +295,14 @@ def main() -> None:
         size=(200000, 3),
     )
     cloud = pv.PolyData(raw_pts)
-    body1 = volume_pv.split_bodies()[1].extract_surface(algorithm="dataset_surface")
-    enclosed = cloud.select_interior_points(body1, check_surface=False)
+    watertight_domain = extract_room_domain(volume_pv)
+    enclosed = cloud.select_interior_points(watertight_domain, check_surface=False)
     mask = enclosed["selected_points"].astype(bool)
     valid_interior_pts = raw_pts[mask]
 
-    # Exclude interior cylindrical columns/pillars from fluid domain
-    walls_bodies = walls_pv.split_bodies()
-    column_bodies = walls_bodies[1:5] if len(walls_bodies) >= 5 else walls_bodies[1:]
-    col_excluded_count = 0
-    for col_idx, col_mesh in enumerate(column_bodies, start=1):
-        cx, cy, cz = col_mesh.center
-        cb = col_mesh.bounds
-        radius = 0.285  # Conservative radius covering full cylinder
-        dist_sq = (valid_interior_pts[:, 0] - cx) ** 2 + (valid_interior_pts[:, 1] - cy) ** 2
-        in_cylinder = (
-            (dist_sq <= radius**2)
-            & (valid_interior_pts[:, 2] >= cb[4] - 0.01)
-            & (valid_interior_pts[:, 2] <= cb[5] + 0.01)
-        )
-        col_excluded_count += int(np.sum(in_cylinder))
-        valid_interior_pts = valid_interior_pts[~in_cylinder]
-
-    print(f"Excluded {col_excluded_count:,} points from inside {len(column_bodies)} cylindrical columns.")
+    # Exclude interior columns and any internal obstacles from fluid domain
+    valid_interior_pts, col_excluded_count = exclude_obstacle_volumes(valid_interior_pts, obstacle_bodies)
+    print(f"Excluded {col_excluded_count:,} points from inside {len(obstacle_bodies)} internal obstacles/columns.")
     interior_pool = torch.tensor(valid_interior_pts, dtype=torch.float32, device=device)
 
     def sample_interior_with_time(n_points):

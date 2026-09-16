@@ -69,7 +69,10 @@ def load_model(
     layer_size = model_config.get("layer_size", 512)
 
     if in_features != 13:
-        print(f"Warning: Checkpoint in_features is {in_features} (expected 13 for multi-window model).")
+        raise ValueError(
+            f"Checkpoint in_features is {in_features}; expected 13 for 8-window model "
+            f"(3 coords + 1 time + 8 windows + 1 occupancy)."
+        )
 
     model = FullyConnected(
         in_features=in_features,
@@ -386,6 +389,8 @@ def main() -> None:
     args = parser.parse_args()
     device = select_device(args.device)
 
+    model, metadata = load_model(args.checkpoint, device)
+
     # Determine 8 window velocities from arguments
     velocities = np.zeros(8, dtype=np.float32)
     if args.velocities is not None:
@@ -405,15 +410,13 @@ def main() -> None:
         velocities = np.ones(8, dtype=np.float32)
 
     print("\n" + "=" * 60)
-    print("Multi-Window Configuration:")
+    print("Multi-Window Configuration (8 Windows):")
     for w_idx, vel in enumerate(velocities, start=1):
         status = "CLOSED" if vel == 0.0 else f"OPEN ({vel:.2f} m/s)"
         print(f"  Window {w_idx}: {status}")
     print(f"Occupancy: {args.occupancy:.0f} occupants")
     print(f"Evaluation Time: {args.time:.1f} s")
     print("=" * 60 + "\n")
-
-    model, metadata = load_model(args.checkpoint, device)
 
     # Load bounds from metadata or fallback to RoomVolume.stl
     if "bounds" in metadata:
