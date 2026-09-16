@@ -35,6 +35,7 @@ from physicsnemo.utils import StaticCaptureEvaluateNoGrad, StaticCaptureTraining
 from omegaconf import DictConfig
 from torch.nn import MSELoss
 from torch.optim import Adam, lr_scheduler
+from training.checkpoint_utils import load_checkpoint_for_training, save_training_checkpoint
 
 
 class NavierStokes(PDE):
@@ -138,6 +139,35 @@ def ldc_trainer(cfg: DictConfig) -> None:
         optimizer, lr_lambda=lambda step: 0.9999871767586216**step
     )
 
+    resume_path = cfg.get("resume") or (cfg.get("training", {}).get("resume") if hasattr(cfg, "training") else None)
+    checkpoint_path = cfg.get("checkpoint") or (cfg.get("training", {}).get("checkpoint") if hasattr(cfg, "training") else None)
+
+    start_iter = 0
+    if resume_path:
+        start_iter, _ = load_checkpoint_for_training(
+            checkpoint_path=resume_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=dist.device,
+            resume=True,
+            expected_in_features=2,
+            expected_out_features=3,
+        )
+    elif checkpoint_path:
+        _, _ = load_checkpoint_for_training(
+            checkpoint_path=checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=dist.device,
+            resume=False,
+            expected_in_features=2,
+            expected_out_features=3,
+        )
+
+    total_iters = getattr(cfg, "max_iters", 10000)
+
     # inference geometry
     x = np.linspace(-0.05, 0.05, 512)
     y = np.linspace(-0.05, 0.05, 512)
@@ -147,7 +177,7 @@ def ldc_trainer(cfg: DictConfig) -> None:
         torch.from_numpy(yy).to(torch.float).to(dist.device),
     )
 
-    for i in range(10000):
+    for i in range(start_iter, total_iters):
         optimizer.zero_grad()
 
         bc_data = sample_boundary(2000, dist.device)
@@ -239,6 +269,24 @@ def ldc_trainer(cfg: DictConfig) -> None:
 
                 plt.savefig(f"./outputs/outputs_pc_{i}.png")
                 plt.close()
+
+                save_training_checkpoint(
+                    f"./outputs/ldc_checkpoint_{i:05d}.pth",
+                    iteration=i,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    extra_metadata={"model_config": {"in_features": 2, "out_features": 3, "num_layers": 6, "layer_size": 512}},
+                )
+
+    save_training_checkpoint(
+        "./outputs/ldc_latest.pth",
+        iteration=total_iters,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        extra_metadata={"model_config": {"in_features": 2, "out_features": 3, "num_layers": 6, "layer_size": 512}},
+    )
 
 
 if __name__ == "__main__":

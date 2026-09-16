@@ -24,6 +24,7 @@ from physicsnemo.mesh.io import from_pyvista
 from physicsnemo.mesh.sampling import sample_random_points_on_cells
 from physicsnemo.models.mlp.fully_connected import FullyConnected
 from physicsnemo.utils.logging import PythonLogger
+from training.checkpoint_utils import load_checkpoint_for_training, save_training_checkpoint
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 GEOM_DIR = os.path.join(REPO_ROOT, "geometries")
@@ -265,16 +266,51 @@ def room_trainer_parametric(cfg: DictConfig) -> None:
     optimizer = Adam(model.parameters(), lr=cfg.scheduler.initial_lr)
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: 0.99998717**step)
 
+    # Checkpoint loading / Resumption
+    resume_path = cfg.get("resume") or (cfg.get("training", {}).get("resume") if hasattr(cfg, "training") else None)
+    checkpoint_path = cfg.get("checkpoint") or (cfg.get("training", {}).get("checkpoint") if hasattr(cfg, "training") else None)
+
+    start_iter = 0
+    if resume_path:
+        start_iter, _ = load_checkpoint_for_training(
+            checkpoint_path=resume_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+            resume=True,
+            expected_in_features=5,
+            expected_out_features=5,
+        )
+    elif checkpoint_path:
+        _, _ = load_checkpoint_for_training(
+            checkpoint_path=checkpoint_path,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+            resume=False,
+            expected_in_features=5,
+            expected_out_features=5,
+        )
+
     total_iters = getattr(cfg, "max_iters", 30000)
+    if start_iter >= total_iters:
+        log.warning(
+            f"Start iteration ({start_iter}) is >= max_iters ({total_iters}). "
+            f"No training needed. Increase max_iters if you wish to continue further."
+        )
+        return
+
     log.info(
-        f"Starting Parametric PINN training for {total_iters:,} iterations "
+        f"Starting Parametric PINN training from iteration {start_iter} to {total_iters:,} "
         f"(t ∈ [0, {t_max:.1f}]s, V_inlet ∈ [{v_min:.1f}, {v_max:.1f}] m/s)..."
     )
     start_time = time.time()
     last_log_time = start_time
-    last_log_iter = 0
+    last_log_iter = start_iter
 
-    for i in range(total_iters):
+    for i in range(start_iter, total_iters):
         optimizer.zero_grad()
 
         inp_walls = sample_surface_with_time_and_param(mesh_walls, walls_areas, 2000, device)
@@ -405,10 +441,7 @@ def room_trainer_parametric(cfg: DictConfig) -> None:
                 pvd_path = os.path.join(iter_dir, "parametric_timelapse.pvd")
                 write_pvd_file(pvd_path, pvd_entries)
 
-            checkpoint_data = {
-                "iteration": i,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
+            extra_meta = {
                 "bounds": bounds,
                 "center": center,
                 "t_max": t_max,
@@ -421,13 +454,24 @@ def room_trainer_parametric(cfg: DictConfig) -> None:
                     "layer_size": 512,
                 },
             }
-            torch.save(checkpoint_data, os.path.join(output_dir, f"model_checkpoint_{i:05d}.pth"))
-            torch.save(checkpoint_data, os.path.join(output_dir, "model_latest.pth"))
+            save_training_checkpoint(
+                os.path.join(output_dir, f"model_checkpoint_{i:05d}.pth"),
+                iteration=i,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                extra_metadata=extra_meta,
+            )
+            save_training_checkpoint(
+                os.path.join(output_dir, "model_latest.pth"),
+                iteration=i,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                extra_metadata=extra_meta,
+            )
 
-    final_checkpoint = {
-        "iteration": total_iters,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
+    extra_meta = {
         "bounds": bounds,
         "center": center,
         "t_max": t_max,
@@ -440,8 +484,22 @@ def room_trainer_parametric(cfg: DictConfig) -> None:
             "layer_size": 512,
         },
     }
-    torch.save(final_checkpoint, os.path.join(output_dir, "model_final.pth"))
-    torch.save(final_checkpoint, os.path.join(output_dir, "model_latest.pth"))
+    save_training_checkpoint(
+        os.path.join(output_dir, "model_final.pth"),
+        iteration=total_iters,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        extra_metadata=extra_meta,
+    )
+    save_training_checkpoint(
+        os.path.join(output_dir, "model_latest.pth"),
+        iteration=total_iters,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        extra_metadata=extra_meta,
+    )
     total_time = time.time() - start_time
     log.info(
         f"Parametric PINN training complete in {format_duration(total_time)}! "

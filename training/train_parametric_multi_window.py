@@ -1,19 +1,28 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
-"""6D Parametric 3D Room Navier-Stokes + CO2 PINN training script.
+"""13D Parametric 3D Room Navier-Stokes + CO2 PINN training script with multi-window velocities.
 
-Trains a 6D surrogate neural network mapping:
-  (x, y, z, t, V_inlet, N_people) -> (u, v, w, p, c)
-across continuous inlet velocities V_inlet in [0.2, 2.5] m/s, physical time t in [0, 120] s,
-and human occupancy count N_people in [0, 50] occupants.
+Trains a 13D surrogate neural network mapping:
+  (x, y, z, t, V_1, V_2, V_3, V_4, V_5, V_6, V_7, V_8, N_people) -> (u, v, w, p, c)
+where:
+  - (x, y, z): 3D spatial position within the room volume [m]
+  - t: Physical time in [0, t_max] [s]
+  - V_1 ... V_8: Independent continuous inlet velocities for each of the 8 window panels in [v_min, v_max] [m/s]
+  - N_people: Human occupancy count in [n_people_min, n_people_max]
 """
 
 import os
+import sys
 import time
 from datetime import datetime
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 from xml.etree import ElementTree as ET
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+GEOM_DIR = os.path.join(REPO_ROOT, "geometries")
 
 import hydra
 import numpy as np
@@ -27,9 +36,6 @@ from physicsnemo.mesh.sampling import sample_random_points_on_cells
 from physicsnemo.models.mlp.fully_connected import FullyConnected
 from physicsnemo.utils.logging import PythonLogger
 from training.checkpoint_utils import load_checkpoint_for_training, save_training_checkpoint
-
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-GEOM_DIR = os.path.join(REPO_ROOT, "geometries")
 
 
 def format_duration(seconds: float) -> str:
@@ -138,7 +144,7 @@ def compute_unsteady_pde_residuals_occupancy(
 
 
 @hydra.main(version_base="1.3", config_path="../", config_name="config.yaml")
-def room_trainer_parametric_occupancy(cfg: DictConfig) -> None:
+def room_trainer_parametric_multi_window(cfg: DictConfig) -> None:
     if torch.backends.mps.is_available():
         device = torch.device("mps")
         print("Accelerating neural network training with Apple Silicon (MPS) 🚀")
@@ -148,19 +154,19 @@ def room_trainer_parametric_occupancy(cfg: DictConfig) -> None:
         device = torch.device("cpu")
         print("Warning: Running on CPU.")
 
-    log = PythonLogger(name="room_pollutant_6d_occupancy")
+    log = PythonLogger(name="room_pollutant_13d_multi_window")
     log.file_logging()
 
     # Parameter ranges
     t_max = float(getattr(cfg, "t_max", 120.0))
-    v_min = float(getattr(cfg, "v_min", 0.2))
+    v_min = float(getattr(cfg, "v_min", 0.0))
     v_max = float(getattr(cfg, "v_max", 2.5))
     n_people_min = float(getattr(cfg, "n_people_min", 0.0))
     n_people_max = float(getattr(cfg, "n_people_max", 50.0))
     tau_ramp = 2.0
 
     date_str = datetime.now().strftime("%Y-%m-%d")
-    output_dir = os.path.join(REPO_ROOT, "outputs", date_str, "parametric_occupancy")
+    output_dir = os.path.join(REPO_ROOT, "outputs", date_str, "parametric_multi_window")
     os.makedirs(output_dir, exist_ok=True)
 
     log.info("Loading STL geometries from geometries/ ...")
@@ -170,8 +176,21 @@ def room_trainer_parametric_occupancy(cfg: DictConfig) -> None:
     doors_pv = pv.read(os.path.join(GEOM_DIR, "Doors.stl"))
 
     mesh_walls = from_pyvista(walls_pv)
-    mesh_windows = from_pyvista(windows_pv)
     mesh_doors = from_pyvista(doors_pv)
+
+    # Split Windows.stl into 8 individual window bodies sorted along the X axis
+    window_bodies = sorted(windows_pv.split_bodies(), key=lambda b: b.center[0])
+    num_windows = len(window_bodies)
+    log.info(f"Loaded {num_windows} individual window bodies from Windows.stl (sorted West->East along X):")
+    mesh_windows = []
+    windows_areas = []
+    for w_idx, body in enumerate(window_bodies, start=1):
+        log.info(
+            f"  Window {w_idx}: X ∈ [{body.bounds[0]:.2f}, {body.bounds[1]:.2f}], "
+            f"Center=({body.center[0]:.2f}, {body.center[1]:.2f}, {body.center[2]:.2f}), Area={body.area:.2f} m²"
+        )
+        mesh_windows.append(from_pyvista(body))
+        windows_areas.append(torch.tensor(body.compute_cell_sizes().cell_data["Area"], dtype=torch.float32))
 
     bounds = volume_pv.bounds
     center = (
@@ -182,18 +201,43 @@ def room_trainer_parametric_occupancy(cfg: DictConfig) -> None:
 
     walls_areas = torch.tensor(walls_pv.compute_cell_sizes().cell_data["Area"], dtype=torch.float32)
     doors_areas = torch.tensor(doors_pv.compute_cell_sizes().cell_data["Area"], dtype=torch.float32)
-    windows_areas = torch.tensor(windows_pv.compute_cell_sizes().cell_data["Area"], dtype=torch.float32)
 
-    def sample_surface_6d(surface_mesh, areas, n_points, current_device):
-        """Sample spatial boundary points with random t, V_inlet, and N_people."""
+    def sample_surface_13d(surface_mesh, areas, n_points, current_device):
+        """Sample spatial boundary points with random t, 8D V_inlet, and N_people."""
         cell_indices = torch.multinomial(areas, n_points, replacement=True).to(current_device)
         pts = sample_random_points_on_cells(surface_mesh, cell_indices).to(
             device=current_device, dtype=torch.float32
         )
         t = torch.rand(n_points, 1, device=current_device, dtype=torch.float32) * t_max
-        v_param = v_min + torch.rand(n_points, 1, device=current_device, dtype=torch.float32) * (v_max - v_min)
+        v_param = v_min + torch.rand(n_points, num_windows, device=current_device, dtype=torch.float32) * (v_max - v_min)
         n_param = n_people_min + torch.rand(n_points, 1, device=current_device, dtype=torch.float32) * (n_people_max - n_people_min)
         return torch.cat([pts, t, v_param, n_param], dim=1)
+
+    def sample_windows_13d(n_points_per_window: int = 150):
+        """Sample boundary points across all 8 windows and compute corresponding target velocities."""
+        inps: List[torch.Tensor] = []
+        v_targets: List[torch.Tensor] = []
+
+        for k in range(num_windows):
+            mesh_k = mesh_windows[k]
+            areas_k = windows_areas[k]
+
+            cell_indices = torch.multinomial(areas_k, n_points_per_window, replacement=True).to(device)
+            pts_k = sample_random_points_on_cells(mesh_k, cell_indices).to(device=device, dtype=torch.float32)
+
+            t_k = torch.rand(n_points_per_window, 1, device=device, dtype=torch.float32) * t_max
+            v_param_k = v_min + torch.rand(n_points_per_window, num_windows, device=device, dtype=torch.float32) * (v_max - v_min)
+            n_param_k = n_people_min + torch.rand(n_points_per_window, 1, device=device, dtype=torch.float32) * (n_people_max - n_people_min)
+
+            # Target velocity for Window k: inflow towards negative Y governed by its specific velocity V_k
+            v_k = v_param_k[:, k : k + 1]
+            v_target_k = -v_k * torch.tanh(3.0 * t_k / tau_ramp)
+
+            inp_k = torch.cat([pts_k, t_k, v_param_k, n_param_k], dim=1)
+            inps.append(inp_k)
+            v_targets.append(v_target_k)
+
+        return torch.cat(inps, dim=0), torch.cat(v_targets, dim=0)
 
     raw_pts = np.random.uniform(
         [bounds[0], bounds[2], bounds[4]],
@@ -229,27 +273,27 @@ def room_trainer_parametric_occupancy(cfg: DictConfig) -> None:
     interior_pool = torch.tensor(valid_interior_pts, dtype=torch.float32, device=device)
     log.info(f"Interior point pool ready: {len(interior_pool):,} points inside watertight room (columns excluded).")
 
-    def sample_interior_6d(n_points):
-        """Sample (x, y, z), t, V_inlet, and N_people."""
+    def sample_interior_13d(n_points):
+        """Sample (x, y, z), t, 8D window velocities, and N_people."""
         idx = torch.randint(0, len(interior_pool), (n_points,), device=device)
         coords = interior_pool[idx].clone().requires_grad_(True)
         t = (torch.rand(n_points, 1, device=device, dtype=torch.float32) * t_max).requires_grad_(True)
-        v_param = v_min + torch.rand(n_points, 1, device=device, dtype=torch.float32) * (v_max - v_min)
+        v_param = v_min + torch.rand(n_points, num_windows, device=device, dtype=torch.float32) * (v_max - v_min)
         n_param = n_people_min + torch.rand(n_points, 1, device=device, dtype=torch.float32) * (n_people_max - n_people_min)
         return coords, t, v_param, n_param
 
-    def sample_initial_condition_6d(n_points):
-        """Sample points at t = 0 with random V_inlet and N_people."""
+    def sample_initial_condition_13d(n_points):
+        """Sample points at t = 0 with random 8D window velocities and N_people."""
         idx = torch.randint(0, len(interior_pool), (n_points,), device=device)
         coords = interior_pool[idx].clone()
         t_zero = torch.zeros(n_points, 1, device=device, dtype=torch.float32)
-        v_param = v_min + torch.rand(n_points, 1, device=device, dtype=torch.float32) * (v_max - v_min)
+        v_param = v_min + torch.rand(n_points, num_windows, device=device, dtype=torch.float32) * (v_max - v_min)
         n_param = n_people_min + torch.rand(n_points, 1, device=device, dtype=torch.float32) * (n_people_max - n_people_min)
         return torch.cat([coords, t_zero, v_param, n_param], dim=1)
 
-    # 6D Model: (x, y, z, t, V_inlet, N_people) -> (u, v, w, p, c)
+    # 13D Model: (x, y, z, t, V_1, ..., V_8, N_people) -> (u, v, w, p, c)
     model = FullyConnected(
-        in_features=6, out_features=5, num_layers=6, layer_size=512
+        in_features=13, out_features=5, num_layers=6, layer_size=512
     ).to(device)
 
     optimizer = Adam(model.parameters(), lr=cfg.scheduler.initial_lr)
@@ -268,7 +312,7 @@ def room_trainer_parametric_occupancy(cfg: DictConfig) -> None:
             scheduler=scheduler,
             device=device,
             resume=True,
-            expected_in_features=6,
+            expected_in_features=13,
             expected_out_features=5,
         )
     elif checkpoint_path:
@@ -279,7 +323,7 @@ def room_trainer_parametric_occupancy(cfg: DictConfig) -> None:
             scheduler=scheduler,
             device=device,
             resume=False,
-            expected_in_features=6,
+            expected_in_features=13,
             expected_out_features=5,
         )
 
@@ -292,8 +336,8 @@ def room_trainer_parametric_occupancy(cfg: DictConfig) -> None:
         return
 
     log.info(
-        f"Starting 6D Parametric PINN training from iteration {start_iter} to {total_iters:,} "
-        f"(t ∈ [0, {t_max:.1f}]s, V_inlet ∈ [{v_min:.1f}, {v_max:.1f}] m/s, N_people ∈ [{n_people_min:.0f}, {n_people_max:.0f}])..."
+        f"Starting 13D Multi-Window Parametric PINN training from iteration {start_iter} to {total_iters:,} "
+        f"(t ∈ [0, {t_max:.1f}]s, V_k ∈ [{v_min:.1f}, {v_max:.1f}] m/s across {num_windows} windows, N_people ∈ [{n_people_min:.0f}, {n_people_max:.0f}])..."
     )
     start_time = time.time()
     last_log_time = start_time
@@ -302,11 +346,11 @@ def room_trainer_parametric_occupancy(cfg: DictConfig) -> None:
     for i in range(start_iter, total_iters):
         optimizer.zero_grad()
 
-        inp_walls = sample_surface_6d(mesh_walls, walls_areas, 2000, device)
-        inp_windows = sample_surface_6d(mesh_windows, windows_areas, 1000, device)
-        inp_doors = sample_surface_6d(mesh_doors, doors_areas, 1000, device)
-        inp_ic = sample_initial_condition_6d(2000)
-        coords_int, t_int, v_int, n_int = sample_interior_6d(8000)
+        inp_walls = sample_surface_13d(mesh_walls, walls_areas, 2000, device)
+        inp_windows, target_windows_v = sample_windows_13d(n_points_per_window=150)
+        inp_doors = sample_surface_13d(mesh_doors, doors_areas, 1000, device)
+        inp_ic = sample_initial_condition_13d(2000)
+        coords_int, t_int, v_int, n_int = sample_interior_13d(8000)
 
         out_walls = model(inp_walls)
         out_windows = model(inp_windows)
@@ -317,20 +361,17 @@ def room_trainer_parametric_occupancy(cfg: DictConfig) -> None:
         # 1. IC at t = 0 (fluid at rest, zero concentration)
         loss_ic = torch.mean(out_ic[:, 0:5] ** 2)
 
-        # 2. Walls no slip
+        # 2. Walls no slip (u=0, v=0, w=0)
         loss_walls = torch.mean(out_walls[:, 0:3] ** 2)
 
-        # 3. Windows: inflow target depends on V_inlet
-        t_win = inp_windows[:, 3:4]
-        v_param_win = inp_windows[:, 4:5]
-        v_target = -v_param_win * torch.tanh(3.0 * t_win / tau_ramp)
-        loss_windows_u = torch.mean(out_windows[:, 0] ** 2)
-        loss_windows_v = torch.mean((out_windows[:, 1] - v_target) ** 2)
-        loss_windows_w = torch.mean(out_windows[:, 2] ** 2)
-        loss_windows_c = torch.mean(out_windows[:, 4] ** 2)
+        # 3. Multi-window inflow: u=0, w=0, c=0, and v matches window-specific inflow target
+        loss_windows_u = torch.mean(out_windows[:, 0:1] ** 2)
+        loss_windows_v = torch.mean((out_windows[:, 1:2] - target_windows_v) ** 2)
+        loss_windows_w = torch.mean(out_windows[:, 2:3] ** 2)
+        loss_windows_c = torch.mean(out_windows[:, 4:5] ** 2)
         loss_windows = loss_windows_u + loss_windows_v + loss_windows_w + loss_windows_c
 
-        # 4. Doors outlet
+        # 4. Doors outlet (p=0)
         loss_doors = torch.mean(out_doors[:, 3] ** 2)
 
         # 5. Unsteady PDE with dynamic CO2 source scaling with N_people
@@ -397,7 +438,8 @@ def room_trainer_parametric_occupancy(cfg: DictConfig) -> None:
             last_log_time = now
             last_log_iter = i
 
-            # Export validation snapshot at nominal V_inlet = 1.0 m/s and N_people = 30
+            # Export validation snapshot with nominal asymmetric ventilation:
+            # e.g., Windows 1, 4, 8 open at 1.5 m/s, others closed (0.0 m/s), N_people = 30
             with torch.no_grad():
                 res_grid = 35
                 grid_x, grid_y, grid_z = np.mgrid[
@@ -411,13 +453,16 @@ def room_trainer_parametric_occupancy(cfg: DictConfig) -> None:
                 iter_dir = os.path.join(output_dir, f"snapshots_iter_{i:05d}")
                 os.makedirs(iter_dir, exist_ok=True)
 
-                v_nom = 1.0
+                # Validation scenario: Asymmetric cross-ventilation
+                v_nom = np.array([1.5, 0.0, 0.0, 1.2, 0.0, 0.0, 0.0, 1.5], dtype=np.float32)
                 n_nom = 30.0
                 for t_val in time_slices:
                     t_col = np.full((grid_pts.shape[0], 1), fill_value=t_val, dtype=np.float32)
-                    v_col = np.full((grid_pts.shape[0], 1), fill_value=v_nom, dtype=np.float32)
+                    v_mat = np.tile(v_nom, (grid_pts.shape[0], 1))
                     n_col = np.full((grid_pts.shape[0], 1), fill_value=n_nom, dtype=np.float32)
-                    eval_inp = torch.tensor(np.hstack([grid_pts, t_col, v_col, n_col]), dtype=torch.float32, device=device)
+                    eval_inp = torch.tensor(
+                        np.hstack([grid_pts, t_col, v_mat, n_col]), dtype=torch.float32, device=device
+                    )
                     preds = model(eval_inp).cpu().numpy()
 
                     vtu = pv.PolyData(grid_pts).cast_to_unstructured_grid()
@@ -428,11 +473,11 @@ def room_trainer_parametric_occupancy(cfg: DictConfig) -> None:
                     vtu.point_data["pressure"] = preds[:, 3]
                     vtu.point_data["pollutant_c"] = preds[:, 4]
 
-                    vtu_name = f"v_{v_nom:.1f}_n_{n_nom:.0f}_t_{t_val:05.1f}s.vtu"
+                    vtu_name = f"multi_win_n_{n_nom:.0f}_t_{t_val:05.1f}s.vtu"
                     vtu.save(os.path.join(iter_dir, vtu_name))
                     pvd_entries.append((float(t_val), vtu_name))
 
-                pvd_path = os.path.join(iter_dir, "parametric_occupancy_timelapse.pvd")
+                pvd_path = os.path.join(iter_dir, "multi_window_timelapse.pvd")
                 write_pvd_file(pvd_path, pvd_entries)
 
             extra_meta = {
@@ -441,10 +486,13 @@ def room_trainer_parametric_occupancy(cfg: DictConfig) -> None:
                 "t_max": t_max,
                 "v_min": v_min,
                 "v_max": v_max,
+                "num_windows": num_windows,
+                "window_centers": [list(b.center) for b in window_bodies],
+                "window_bounds": [list(b.bounds) for b in window_bodies],
                 "n_people_min": n_people_min,
                 "n_people_max": n_people_max,
                 "model_config": {
-                    "in_features": 6,
+                    "in_features": 13,
                     "out_features": 5,
                     "num_layers": 6,
                     "layer_size": 512,
@@ -473,10 +521,13 @@ def room_trainer_parametric_occupancy(cfg: DictConfig) -> None:
         "t_max": t_max,
         "v_min": v_min,
         "v_max": v_max,
+        "num_windows": num_windows,
+        "window_centers": [list(b.center) for b in window_bodies],
+        "window_bounds": [list(b.bounds) for b in window_bodies],
         "n_people_min": n_people_min,
         "n_people_max": n_people_max,
         "model_config": {
-            "in_features": 6,
+            "in_features": 13,
             "out_features": 5,
             "num_layers": 6,
             "layer_size": 512,
@@ -500,10 +551,10 @@ def room_trainer_parametric_occupancy(cfg: DictConfig) -> None:
     )
     total_time = time.time() - start_time
     log.info(
-        f"6D Parametric Occupancy PINN training complete in {format_duration(total_time)}! "
+        f"13D Multi-Window PINN training complete in {format_duration(total_time)}! "
         f"Saved final model to {os.path.join(output_dir, 'model_final.pth')}"
     )
 
 
 if __name__ == "__main__":
-    room_trainer_parametric_occupancy()
+    room_trainer_parametric_multi_window()

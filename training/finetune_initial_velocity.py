@@ -22,6 +22,7 @@ from torch.optim import Adam, lr_scheduler
 from physicsnemo.mesh.io import from_pyvista
 from physicsnemo.mesh.sampling import sample_random_points_on_cells
 from physicsnemo.models.mlp.fully_connected import FullyConnected
+from training.checkpoint_utils import load_checkpoint_for_training, save_training_checkpoint
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 GEOM_DIR = os.path.join(REPO_ROOT, "geometries")
@@ -155,8 +156,14 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint",
         type=str,
-        required=True,
-        help="Path to source trained checkpoint (.pth).",
+        default=None,
+        help="Path to source trained checkpoint (.pth) for warm starting.",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to checkpoint (.pth) to resume fine-tuning (restores optimizer & iteration).",
     )
     parser.add_argument(
         "--initial-velocity",
@@ -219,29 +226,30 @@ def main() -> None:
     )
     os.makedirs(out_dir, exist_ok=True)
 
+    source_path = args.resume or args.checkpoint
+    if not source_path:
+        raise ValueError("Either --checkpoint or --resume must be specified.")
+
     print(f"\n{'='*65}")
     print(f"Time-Dependent PINN Fine-Tuning")
-    print(f"  Source Checkpoint: {args.checkpoint}")
+    print(f"  Source Checkpoint: {source_path} (Mode: {'Resume' if args.resume else 'Warm-Start'})")
     print(f"  Target Initial Velocity at t=0: ({u0:.2f}, {v0:.2f}, {w0:.2f}) m/s")
     print(f"  Iterations: {args.iterations:,} | LR: {args.lr:.2e} | T_max: {t_max:.1f}s")
     print(f"  Output Directory: {out_dir}")
     print(f"{'='*65}\n")
 
-    # Load checkpoint
-    if not os.path.exists(args.checkpoint):
-        raise FileNotFoundError(f"Checkpoint not found at: {args.checkpoint}")
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    # Inspect checkpoint config
+    if not os.path.exists(source_path):
+        raise FileNotFoundError(f"Checkpoint not found at: {source_path}")
+    raw_ckpt = torch.load(source_path, map_location="cpu", weights_only=False)
+    model_config = raw_ckpt.get("model_config", {"in_features": 4, "out_features": 5, "num_layers": 6, "layer_size": 512}) if isinstance(raw_ckpt, dict) else {"in_features": 4, "out_features": 5, "num_layers": 6, "layer_size": 512}
 
-    model_config = ckpt.get("model_config", {"in_features": 4, "out_features": 5, "num_layers": 6, "layer_size": 512})
     model = FullyConnected(
         in_features=model_config.get("in_features", 4),
         out_features=model_config.get("out_features", 5),
         num_layers=model_config.get("num_layers", 6),
         layer_size=model_config.get("layer_size", 512),
     ).to(device)
-
-    state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
-    model.load_state_dict(state_dict)
     model.train()
 
     # Load geometry
@@ -319,11 +327,28 @@ def main() -> None:
     optimizer = Adam(model.parameters(), lr=args.lr)
     scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.iterations, eta_min=1e-5)
 
+    is_resume = bool(args.resume)
+    start_iter, _ = load_checkpoint_for_training(
+        checkpoint_path=source_path,
+        model=model,
+        optimizer=optimizer if is_resume else None,
+        scheduler=scheduler if is_resume else None,
+        device=device,
+        resume=is_resume,
+        expected_in_features=4,
+        expected_out_features=5,
+    )
+
+    total_iters = args.iterations
+    if is_resume and start_iter >= total_iters:
+        print(f"Warning: start_iter ({start_iter}) >= iterations ({total_iters}). No more iterations to run.")
+        return
+
     start_time = time.time()
     last_log_time = start_time
-    last_log_iter = 0
+    last_log_iter = start_iter
 
-    for i in range(args.iterations):
+    for i in range(start_iter, total_iters):
         optimizer.zero_grad()
 
         inp_walls = sample_surface_with_time(mesh_walls, walls_areas, 2000, device)
@@ -425,15 +450,21 @@ def main() -> None:
         pvd_path = os.path.join(out_dir, "finetuned_timelapse.pvd")
         write_pvd_file(pvd_path, pvd_entries)
 
-    final_ckpt = {
-        "model_state_dict": model.state_dict(),
+    extra_meta = {
         "bounds": bounds,
         "center": center,
         "t_max": t_max,
         "initial_velocity": (u0, v0, w0),
         "model_config": model_config,
     }
-    torch.save(final_ckpt, os.path.join(out_dir, "finetuned_model_final.pth"))
+    save_training_checkpoint(
+        os.path.join(out_dir, "finetuned_model_final.pth"),
+        iteration=total_iters,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        extra_metadata=extra_meta,
+    )
     print(f"\nFine-tuning completed in {format_duration(time.time() - start_time)}!")
     print(f"Saved fine-tuned checkpoint to: {os.path.join(out_dir, 'finetuned_model_final.pth')}")
 
