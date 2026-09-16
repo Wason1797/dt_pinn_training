@@ -18,12 +18,14 @@ pinn_training/
 │   ├── train_time_dependent.py     # 4D (x,y,z,t) Unsteady PINN (T_max=120s, 30k iters)
 │   ├── finetune_initial_velocity.py# Fine-tune checkpoint for custom IC (u0, v0, w0)
 │   ├── train_parametric.py         # 5D (x,y,z,t,V_inlet) Parametric PINN (120s, 30k iters)
-│   └── train_parametric_occupancy.py # 6D (x,y,z,t,V_inlet,N_people) Parametric PINN
+│   ├── train_parametric_occupancy.py # 6D (x,y,z,t,V_inlet,N_people) Parametric PINN
+│   └── train_parametric_multi_window.py # 13D (x,y,z,t,V_1..V_8,N_people) Multi-Window PINN
 ├── inference/                      # Forward evaluation & visualization exporters
 │   ├── inference_steady.py         # Steady-state field, streamline & sweep exporter
 │   ├── inference_time_dependent.py # Physical time-lapse & unsteady pathline exporter (120s)
 │   ├── inference_parametric.py     # Real-time query for arbitrary V_inlet (0.2 - 2.5 m/s)
-│   └── inference_parametric_occupancy.py # Real-time query for arbitrary V_inlet & N_people
+│   ├── inference_parametric_occupancy.py # Real-time query for arbitrary V_inlet & N_people
+│   └── inference_parametric_multi_window.py # Real-time query for independent window velocities (V1..V8)
 ├── rendering/                      # Headless visualization & video rendering
 │   └── paraview_animate.py         # ParaView / pvpython batch animation renderer
 ├── outputs/                        # Checkpoints (.pth), snapshots (.vtu), and collections (.pvd)
@@ -160,6 +162,35 @@ $$\begin{aligned}
 
 ---
 
+### Resuming Training & Loading Checkpoints
+
+All training pipelines support continuing an existing run or warm-starting a new run from a checkpoint:
+
+1. **Continue / Resume Training (`resume=...` or `--resume`):**
+   Restores model parameters, optimizer momentum, scheduler step progression, and continues training from `iteration + 1` up to `max_iters`:
+   ```bash
+   # Continue time-dependent PINN from checkpoint up to 30k iterations
+   .venv/bin/python training/train_time_dependent.py resume=outputs/2026-09-14/time_dependent/model_checkpoint_10000.pth
+
+   # Continue steady-state training
+   .venv/bin/python training/train_steady.py resume=outputs/2026-09-14/model_checkpoint_10000.pth
+
+   # Resume fine-tuning run
+   .venv/bin/python training/finetune_initial_velocity.py --resume outputs/2026-09-15/finetuned_u0_0.0_-0.2_0.0/finetuned_model_final.pth --iterations 5000
+   ```
+
+2. **Warm-Start / Pretrained Model Initialization (`checkpoint=...` or `--checkpoint`):**
+   Initializes model weights from an existing checkpoint but starts a fresh run at iteration 0 with brand new optimizer and learning rate states:
+   ```bash
+   # Initialize steady PINN weights from pretrained model but start at iteration 0
+   .venv/bin/python training/train_steady.py checkpoint=outputs/2026-09-14/model_latest.pth max_iters=10000
+
+   # Warm-start parametric PINN
+   .venv/bin/python training/train_parametric.py checkpoint=outputs/2026-09-14/parametric/model_latest.pth
+   ```
+
+---
+
 ### Step 2: Inference & Animation Generation
 
 The inference scripts evaluate the neural network over 3D spatial grids and particle systems, generating `.vtu` and `.pvd` collections.
@@ -261,7 +292,40 @@ The inference scripts evaluate the neural network over 3D spatial grids and part
 
 ---
 
-#### 2.3 Generating Steady-State Visualizations ([inference/inference_steady.py](inference/inference_steady.py))
+#### 2.4 Generating Multi-Window Visualizations ([inference/inference_parametric_multi_window.py](inference/inference_parametric_multi_window.py))
+
+Evaluate arbitrary combinations of independent window velocities across all 8 window panels:
+
+```bash
+# 1. Open specific windows (e.g., Windows 1, 4, and 8 at 1.5 m/s; others closed) with 2D slice
+.venv/bin/python inference/inference_parametric_multi_window.py \
+  --checkpoint outputs/2026-09-16/parametric_multi_window/model_final.pth \
+  --open-windows 1 4 8 \
+  --open-velocity 1.5 \
+  --occupancy 25.0 \
+  --time 60.0 \
+  --save-slice
+
+# 2. Specify independent velocities for all 8 windows explicitly:
+.venv/bin/python inference/inference_parametric_multi_window.py \
+  --checkpoint outputs/2026-09-16/parametric_multi_window/model_final.pth \
+  --velocities 1.5 0.0 0.0 1.2 0.0 0.0 0.0 1.5 \
+  --occupancy 30.0 \
+  --time 30.0
+
+# 3. Export full animation time-lapse sequence (PVD + VTU):
+.venv/bin/python inference/inference_parametric_multi_window.py \
+  --checkpoint outputs/2026-09-16/parametric_multi_window/model_final.pth \
+  --open-windows 1 4 8 \
+  --open-velocity 1.5 \
+  --occupancy 30.0 \
+  --timelapse \
+  --n-frames 60
+```
+
+---
+
+#### 2.5 Generating Steady-State Visualizations ([inference/inference_steady.py](inference/inference_steady.py))
 
 ```bash
 # Export 3D volume, steady streamlines, and spatial slice sweep
@@ -337,6 +401,10 @@ You can render full HD PNG image sequences or AVI videos directly from the comma
 | **Train Unsteady** | `training/train_time_dependent.py` | `.venv/bin/python training/train_time_dependent.py` |
 | **Fine-Tune IC** | `training/finetune_initial_velocity.py` | `.venv/bin/python training/finetune_initial_velocity.py --checkpoint <ckpt> --initial-velocity 0 -0.2 0` |
 | **Train Parametric** | `training/train_parametric.py` | `.venv/bin/python training/train_parametric.py` |
+| **Train Occupancy** | `training/train_parametric_occupancy.py` | `.venv/bin/python training/train_parametric_occupancy.py` |
+| **Train Multi-Window** | `training/train_parametric_multi_window.py` | `.venv/bin/python training/train_parametric_multi_window.py` |
 | **Unsteady Inference**| `inference/inference_time_dependent.py`| `.venv/bin/python inference/inference_time_dependent.py --checkpoint <ckpt> --animate all` |
 | **Parametric Query** | `inference/inference_parametric.py` | `.venv/bin/python inference/inference_parametric.py --checkpoint <ckpt> --velocity 1.8 --animate all` |
+| **Occupancy Query** | `inference/inference_parametric_occupancy.py` | `.venv/bin/python inference/inference_parametric_occupancy.py --checkpoint <ckpt> --velocity 1.5 --occupancy 30` |
+| **Multi-Window Query**| `inference/inference_parametric_multi_window.py` | `.venv/bin/python inference/inference_parametric_multi_window.py --checkpoint <ckpt> --open-windows 1 4 8 --open-velocity 1.5` |
 | **Render Video/PNG** | `rendering/paraview_animate.py` | `/Applications/ParaView-6.1.1.app/Contents/bin/pvpython rendering/paraview_animate.py --input <pvd>` |
