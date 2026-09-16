@@ -162,6 +162,14 @@ $$\begin{aligned}
 
 ---
 
+#### 1.6 13D Multi-Window Parametric PINN ($V_1 \\dots V_8 \\in [0.2,\\, 2.5]\\,\\text{m/s},\\; N_{\\text{people}} \\in [0,\\, 50]$)
+*Trains a 13D surrogate model predicting airflow and $\\text{CO}_2$ concentration for independent window velocities and occupant count.*
+```bash
+.venv/bin/python training/train_parametric_multi_window.py
+```
+- **What it does:** Trains a 13D MLP $(x, y, z, t, V_1, V_2, V_3, V_4, V_5, V_6, V_7, V_8, N_{\\text{people}}) \\to (u, v, w, p, c)$ where each $V_i$ represents the independent inlet velocity for window $i$, and the $\\text{CO}_2$ source rate scales with occupancy ($S_0 = N_{\\text{people}} \\times 1.15 \\times 10^{-4}\\,\\text{g}/(\\text{m}^3\\cdot\\text{s})$).
+- **Outputs:** Saves `outputs/YYYY-MM-DD/parametric_multi_window/model_final.pth`.
+
 ### Resuming Training & Loading Checkpoints
 
 All training pipelines support continuing an existing run or warm-starting a new run from a checkpoint:
