@@ -5,11 +5,15 @@
 
 Same physics, geometry, sampling and exports as train_parametric_multi_window.py, but with:
   - a configurable network: arch.num_layers / arch.layer_size / arch.activation
-    (defaults: 5 hidden layers x 128, Tanh - the activation from the AIQ notebook)
+    (defaults: 6 hidden layers x 256, Tanh - the activation from the AIQ notebook)
   - a FLAT learning rate: this script constructs no lr_scheduler at all
-  - per-term loss weights (phy / walls / windows / doors / ic)
+  - per-term loss weights (phy / walls / windows / doors / ic), all 1.0 by default so
+    the default objective is identical to the baseline's unweighted sum
   - both the weighted total AND the raw unweighted per-term losses logged, so runs with
     different weights stay directly comparable to the unweighted baseline
+  - a graceful Ctrl+C: the first interrupt finishes the current iteration, writes a
+    resumable checkpoint (model_interrupted_<iter>.pth + model_latest.pth) and exits;
+    a second interrupt aborts immediately, discarding whatever is unsaved
 
 Trains a 13D surrogate neural network mapping:
   (x, y, z, t, V_1, ..., V_N, N_people) -> (u, v, w, p, c)
@@ -19,6 +23,7 @@ All configuration lives in config_multi_window_tanh.yaml at the repo root.
 """
 
 import os
+import signal
 import sys
 import time
 from datetime import datetime
@@ -546,211 +551,271 @@ def room_trainer_multi_window_tanh(cfg: DictConfig) -> None:
         f"Points per iteration: interior={pts_int}, walls={pts_walls}, "
         f"windows={pts_win}x{num_windows}, doors={pts_doors}, ic={pts_ic}"
     )
+    # ----------------------------------------------------------- graceful Ctrl+C
+    # A bare KeyboardInterrupt would kill the run mid-iteration and throw away every
+    # iteration since the last snapshot_every checkpoint. Instead the first SIGINT only
+    # raises a flag, which the loop checks once the current iteration has fully finished
+    # (forward, backward and optimizer.step all done), so the checkpoint written on the
+    # way out is a consistent, resumable state. A second SIGINT is an explicit "don't
+    # bother saving": it restores the default handler and raises.
+    stop_requested = {"flag": False}
+
+    def handle_sigint(signum, frame):
+        if stop_requested["flag"]:
+            log.warning("Second interrupt received - aborting NOW, without saving.")
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            raise KeyboardInterrupt
+        stop_requested["flag"] = True
+        log.warning(
+            "\nInterrupt received (Ctrl+C). Finishing the current iteration, then writing a "
+            "resumable checkpoint. Press Ctrl+C again to abort immediately."
+        )
+
+    previous_sigint = signal.signal(signal.SIGINT, handle_sigint)
+    interrupted_at = None
+    i = start_iter  # bound up-front so the abort message below is safe on an early interrupt
+
     start_time = time.time()
     last_log_time = start_time
     last_log_iter = start_iter
 
-    for i in range(start_iter, total_iters):
-        optimizer.zero_grad()
+    try:
+        for i in range(start_iter, total_iters):
+            optimizer.zero_grad()
 
-        inp_walls = sample_surface_13d(mesh_walls, walls_areas, pts_walls, device)
-        inp_windows, target_windows_v = sample_windows_13d(n_points_per_window=pts_win)
-        inp_doors = sample_surface_13d(mesh_doors, doors_areas, pts_doors, device)
-        inp_ic = sample_initial_condition_13d(pts_ic)
-        coords_int, t_int, v_int, n_int = sample_interior_13d(pts_int)
+            inp_walls = sample_surface_13d(mesh_walls, walls_areas, pts_walls, device)
+            inp_windows, target_windows_v = sample_windows_13d(n_points_per_window=pts_win)
+            inp_doors = sample_surface_13d(mesh_doors, doors_areas, pts_doors, device)
+            inp_ic = sample_initial_condition_13d(pts_ic)
+            coords_int, t_int, v_int, n_int = sample_interior_13d(pts_int)
 
-        out_walls = model(inp_walls)
-        out_windows = model(inp_windows)
-        out_doors = model(inp_doors)
-        out_ic = model(inp_ic)
-        out_interior = model(torch.cat([coords_int, t_int, v_int, n_int], dim=1))
+            out_walls = model(inp_walls)
+            out_windows = model(inp_windows)
+            out_doors = model(inp_doors)
+            out_ic = model(inp_ic)
+            out_interior = model(torch.cat([coords_int, t_int, v_int, n_int], dim=1))
 
-        # 1. IC at t = 0 (fluid at rest, zero concentration)
-        loss_ic = torch.mean(out_ic[:, 0:5] ** 2)
+            # 1. IC at t = 0 (fluid at rest, zero concentration)
+            loss_ic = torch.mean(out_ic[:, 0:5] ** 2)
 
-        # 2. Walls no slip (u=0, v=0, w=0)
-        loss_walls = torch.mean(out_walls[:, 0:3] ** 2)
+            # 2. Walls no slip (u=0, v=0, w=0)
+            loss_walls = torch.mean(out_walls[:, 0:3] ** 2)
 
-        # 3. Multi-window inflow: u=0, w=0, c=0, and v matches window-specific inflow target
-        loss_windows_u = torch.mean(out_windows[:, 0:1] ** 2)
-        loss_windows_v = torch.mean((out_windows[:, 1:2] - target_windows_v) ** 2)
-        loss_windows_w = torch.mean(out_windows[:, 2:3] ** 2)
-        loss_windows_c = torch.mean(out_windows[:, 4:5] ** 2)
-        loss_windows = loss_windows_u + loss_windows_v + loss_windows_w + loss_windows_c
+            # 3. Multi-window inflow: u=0, w=0, c=0, and v matches window-specific inflow target
+            loss_windows_u = torch.mean(out_windows[:, 0:1] ** 2)
+            loss_windows_v = torch.mean((out_windows[:, 1:2] - target_windows_v) ** 2)
+            loss_windows_w = torch.mean(out_windows[:, 2:3] ** 2)
+            loss_windows_c = torch.mean(out_windows[:, 4:5] ** 2)
+            loss_windows = loss_windows_u + loss_windows_v + loss_windows_w + loss_windows_c
 
-        # 4. Doors outlet (p=0)
-        loss_doors = torch.mean(out_doors[:, 3] ** 2)
+            # 4. Doors outlet (p=0)
+            loss_doors = torch.mean(out_doors[:, 3] ** 2)
 
-        # 5. Unsteady PDE with dynamic CO2 source scaling with N_people
-        res_dict = compute_unsteady_pde_residuals_occupancy(
-            coords=coords_int,
-            t=t_int,
-            n_people=n_int,
-            out=out_interior,
-            nu=nu,
-            rho=rho,
-            D=diffusivity,
-            center=center,
-            emission_per_person=emission_pp,
-            sigma=sigma,
-        )
-        loss_phy = (
-            torch.mean(res_dict["continuity"] ** 2)
-            + torch.mean(res_dict["momentum_x"] ** 2)
-            + torch.mean(res_dict["momentum_y"] ** 2)
-            + torch.mean(res_dict["momentum_z"] ** 2)
-            + torch.mean(res_dict["transport"] ** 2)
-        )
-
-        # Weighted objective: the only thing that is optimized. The per-term formulas above
-        # are byte-identical to the baseline trainer's, so the raw values logged below stay
-        # directly comparable across weightings.
-        total_loss = (
-            w_phy * loss_phy
-            + w_walls * loss_walls
-            + w_windows * loss_windows
-            + w_doors * loss_doors
-            + w_ic * loss_ic
-        )
-        total_loss.backward()
-        optimizer.step()
-        # (no scheduler.step())
-
-        do_short = (i % log_every == 0 and i > 0 and i % snapshot_every != 0)
-        do_block = (i % snapshot_every == 0)
-
-        if do_short or do_block:
-            # .item() forces a device sync on MPS, so only fetch inside the logging branches
-            with torch.no_grad():
-                r_phy = loss_phy.item()
-                r_walls = loss_walls.item()
-                r_win = loss_windows.item()
-                r_doors = loss_doors.item()
-                r_ic = loss_ic.item()
-            raw_sum = r_phy + r_walls + r_win + r_doors + r_ic  # plain floats, no second sync
-            w_total = total_loss.item()
-            current_lr = optimizer.param_groups[0]["lr"]
-
-            if log_csv:
-                with open(csv_path, "a") as fh:
-                    fh.write(
-                        f"{i},{w_total:.8f},{raw_sum:.8f},{r_phy:.8f},{r_ic:.8f},"
-                        f"{r_walls:.8f},{r_win:.8f},{r_doors:.8f},{current_lr:.8e}\n"
-                    )
-
-        if do_short:
-            now = time.time()
-            elapsed = now - start_time
-            recent_elapsed = now - last_log_time
-            recent_iters = i - last_log_iter
-            speed = recent_iters / recent_elapsed if recent_elapsed > 0 else 0.0
-            sec_per_it = 1.0 / speed if speed > 0 else 0.0
-            eta_seconds = (total_iters - i) / speed if speed > 0 else 0.0
-            pct = (i / total_iters) * 100.0
-            log.info(
-                f"[Iter: {i:05d}/{total_iters} ({pct:4.1f}%)] | "
-                f"WLoss: {w_total:.5f} | RawSum: {raw_sum:.5f} | "
-                f"raw Phy={r_phy:.5f}, IC={r_ic:.5f}, Walls={r_walls:.5f}, "
-                f"Win={r_win:.5f}, Doors={r_doors:.5f} | "
-                f"Speed: {sec_per_it:.2f} s/it ({speed:4.2f} it/s) | "
-                f"Elapsed: {format_duration(elapsed)} | "
-                f"ETA: {format_duration(eta_seconds)}"
+            # 5. Unsteady PDE with dynamic CO2 source scaling with N_people
+            res_dict = compute_unsteady_pde_residuals_occupancy(
+                coords=coords_int,
+                t=t_int,
+                n_people=n_int,
+                out=out_interior,
+                nu=nu,
+                rho=rho,
+                D=diffusivity,
+                center=center,
+                emission_per_person=emission_pp,
+                sigma=sigma,
+            )
+            loss_phy = (
+                torch.mean(res_dict["continuity"] ** 2)
+                + torch.mean(res_dict["momentum_x"] ** 2)
+                + torch.mean(res_dict["momentum_y"] ** 2)
+                + torch.mean(res_dict["momentum_z"] ** 2)
+                + torch.mean(res_dict["transport"] ** 2)
             )
 
-        if do_block:
-            now = time.time()
-            elapsed = now - start_time
-            pct = (i / total_iters) * 100.0
-            avg_speed = i / elapsed if (i > 0 and elapsed > 0) else 0.0
-            eta_seconds = (total_iters - i) / avg_speed if avg_speed > 0 else 0.0
-            eta_str = format_duration(eta_seconds) if i > 0 else "estimating..."
-
-            log.info(
-                f"\n{'='*72}\n"
-                f"[Iter: {i:05d}/{total_iters} ({pct:4.1f}%)] "
-                f"Weighted Total: {w_total:.5f} | Unweighted Sum: {raw_sum:.5f}\n"
-                f"  Raw (unweighted, comparable to the baseline trainer):\n"
-                f"    Phy={r_phy:.5f}, IC={r_ic:.5f}, Walls={r_walls:.5f}, "
-                f"Win={r_win:.5f}, Doors={r_doors:.5f}\n"
-                f"  Weighted contributions (weight x raw):\n"
-                f"    Phy={w_phy*r_phy:.5f} (w={w_phy:g}), IC={w_ic*r_ic:.5f} (w={w_ic:g}), "
-                f"Walls={w_walls*r_walls:.5f} (w={w_walls:g}), "
-                f"Win={w_windows*r_win:.5f} (w={w_windows:g}), "
-                f"Doors={w_doors*r_doors:.5f} (w={w_doors:g})\n"
-                f"  Arch: {arch_num_layers}x{arch_layer_size} [{arch_activation}] | "
-                f"LR={current_lr:.2e} (flat, no scheduler)\n"
-                f"  Time Remaining: ETA={eta_str} | Elapsed={format_duration(elapsed)}\n"
-                f"  Speed:          {avg_speed:5.1f} it/s\n"
-                f"{'='*72}"
+            # Weighted objective: the only thing that is optimized. The per-term formulas above
+            # are byte-identical to the baseline trainer's, so the raw values logged below stay
+            # directly comparable across weightings.
+            total_loss = (
+                w_phy * loss_phy
+                + w_walls * loss_walls
+                + w_windows * loss_windows
+                + w_doors * loss_doors
+                + w_ic * loss_ic
             )
-            last_log_time = now
-            last_log_iter = i
+            total_loss.backward()
+            optimizer.step()
+            # (no scheduler.step())
 
-            # Export validation snapshot with nominal asymmetric ventilation:
-            # e.g., Windows 1, 4, 8 open at 1.5 m/s, others closed (0.0 m/s), N_people = 30
-            with torch.no_grad():
-                res_grid = snapshot_resolution
-                grid_x, grid_y, grid_z = np.mgrid[
-                    bounds[0] : bounds[1] : complex(0, res_grid),
-                    bounds[2] : bounds[3] : complex(0, res_grid),
-                    bounds[4] : bounds[5] : complex(0, res_grid),
-                ]
-                grid_pts = np.vstack((grid_x.flatten(), grid_y.flatten(), grid_z.flatten())).T.astype(np.float32)
-                time_slices = np.linspace(0.0, t_max, 5)
-                pvd_entries = []
-                iter_dir = os.path.join(output_dir, f"snapshots_iter_{i:05d}")
-                os.makedirs(iter_dir, exist_ok=True)
+            do_short = (i % log_every == 0 and i > 0 and i % snapshot_every != 0)
+            do_block = (i % snapshot_every == 0)
 
-                # Validation scenario: Asymmetric cross-ventilation
-                v_nom = np.zeros(num_windows, dtype=np.float32)
-                if num_windows >= 1:
-                    v_nom[0] = 1.5
-                if num_windows >= 4:
-                    v_nom[3] = 1.2
-                if num_windows >= 8:
-                    v_nom[7] = 1.5
-                n_nom = 30.0
-                for t_val in time_slices:
-                    t_col = np.full((grid_pts.shape[0], 1), fill_value=t_val, dtype=np.float32)
-                    v_mat = np.tile(v_nom, (grid_pts.shape[0], 1))
-                    n_col = np.full((grid_pts.shape[0], 1), fill_value=n_nom, dtype=np.float32)
-                    eval_inp = torch.tensor(
-                        np.hstack([grid_pts, t_col, v_mat, n_col]), dtype=torch.float32, device=device
-                    )
-                    preds = model(eval_inp).cpu().numpy()
+            if do_short or do_block:
+                # .item() forces a device sync on MPS, so only fetch inside the logging branches
+                with torch.no_grad():
+                    r_phy = loss_phy.item()
+                    r_walls = loss_walls.item()
+                    r_win = loss_windows.item()
+                    r_doors = loss_doors.item()
+                    r_ic = loss_ic.item()
+                raw_sum = r_phy + r_walls + r_win + r_doors + r_ic  # plain floats, no second sync
+                w_total = total_loss.item()
+                current_lr = optimizer.param_groups[0]["lr"]
 
-                    vtu = pv.PolyData(grid_pts).cast_to_unstructured_grid()
-                    vtu.point_data["velocity_u"] = preds[:, 0]
-                    vtu.point_data["velocity_v"] = preds[:, 1]
-                    vtu.point_data["velocity_w"] = preds[:, 2]
-                    vtu.point_data["velocity_mag"] = np.linalg.norm(preds[:, 0:3], axis=1)
-                    vtu.point_data["pressure"] = preds[:, 3]
-                    vtu.point_data["pollutant_c"] = preds[:, 4]
+                if log_csv:
+                    with open(csv_path, "a") as fh:
+                        fh.write(
+                            f"{i},{w_total:.8f},{raw_sum:.8f},{r_phy:.8f},{r_ic:.8f},"
+                            f"{r_walls:.8f},{r_win:.8f},{r_doors:.8f},{current_lr:.8e}\n"
+                        )
 
-                    vtu_name = f"multi_win_n_{n_nom:.0f}_t_{t_val:05.1f}s.vtu"
-                    vtu.save(os.path.join(iter_dir, vtu_name))
-                    pvd_entries.append((float(t_val), vtu_name))
+            if do_short:
+                now = time.time()
+                elapsed = now - start_time
+                recent_elapsed = now - last_log_time
+                recent_iters = i - last_log_iter
+                speed = recent_iters / recent_elapsed if recent_elapsed > 0 else 0.0
+                sec_per_it = 1.0 / speed if speed > 0 else 0.0
+                eta_seconds = (total_iters - i) / speed if speed > 0 else 0.0
+                pct = (i / total_iters) * 100.0
+                log.info(
+                    f"[Iter: {i:05d}/{total_iters} ({pct:4.1f}%)] | "
+                    f"WLoss: {w_total:.5f} | RawSum: {raw_sum:.5f} | "
+                    f"raw Phy={r_phy:.5f}, IC={r_ic:.5f}, Walls={r_walls:.5f}, "
+                    f"Win={r_win:.5f}, Doors={r_doors:.5f} | "
+                    f"Speed: {sec_per_it:.2f} s/it ({speed:4.2f} it/s) | "
+                    f"Elapsed: {format_duration(elapsed)} | "
+                    f"ETA: {format_duration(eta_seconds)}"
+                )
 
-                pvd_path = os.path.join(iter_dir, "multi_window_timelapse.pvd")
-                write_pvd_file(pvd_path, pvd_entries)
+            if do_block:
+                now = time.time()
+                elapsed = now - start_time
+                pct = (i / total_iters) * 100.0
+                avg_speed = i / elapsed if (i > 0 and elapsed > 0) else 0.0
+                eta_seconds = (total_iters - i) / avg_speed if avg_speed > 0 else 0.0
+                eta_str = format_duration(eta_seconds) if i > 0 else "estimating..."
 
-            extra_meta = build_extra_meta()
+                log.info(
+                    f"\n{'='*72}\n"
+                    f"[Iter: {i:05d}/{total_iters} ({pct:4.1f}%)] "
+                    f"Weighted Total: {w_total:.5f} | Unweighted Sum: {raw_sum:.5f}\n"
+                    f"  Raw (unweighted, comparable to the baseline trainer):\n"
+                    f"    Phy={r_phy:.5f}, IC={r_ic:.5f}, Walls={r_walls:.5f}, "
+                    f"Win={r_win:.5f}, Doors={r_doors:.5f}\n"
+                    f"  Weighted contributions (weight x raw):\n"
+                    f"    Phy={w_phy*r_phy:.5f} (w={w_phy:g}), IC={w_ic*r_ic:.5f} (w={w_ic:g}), "
+                    f"Walls={w_walls*r_walls:.5f} (w={w_walls:g}), "
+                    f"Win={w_windows*r_win:.5f} (w={w_windows:g}), "
+                    f"Doors={w_doors*r_doors:.5f} (w={w_doors:g})\n"
+                    f"  Arch: {arch_num_layers}x{arch_layer_size} [{arch_activation}] | "
+                    f"LR={current_lr:.2e} (flat, no scheduler)\n"
+                    f"  Time Remaining: ETA={eta_str} | Elapsed={format_duration(elapsed)}\n"
+                    f"  Speed:          {avg_speed:5.1f} it/s\n"
+                    f"{'='*72}"
+                )
+                last_log_time = now
+                last_log_iter = i
+
+                # Export validation snapshot with nominal asymmetric ventilation:
+                # e.g., Windows 1, 4, 8 open at 1.5 m/s, others closed (0.0 m/s), N_people = 30
+                with torch.no_grad():
+                    res_grid = snapshot_resolution
+                    grid_x, grid_y, grid_z = np.mgrid[
+                        bounds[0] : bounds[1] : complex(0, res_grid),
+                        bounds[2] : bounds[3] : complex(0, res_grid),
+                        bounds[4] : bounds[5] : complex(0, res_grid),
+                    ]
+                    grid_pts = np.vstack((grid_x.flatten(), grid_y.flatten(), grid_z.flatten())).T.astype(np.float32)
+                    time_slices = np.linspace(0.0, t_max, 5)
+                    pvd_entries = []
+                    iter_dir = os.path.join(output_dir, f"snapshots_iter_{i:05d}")
+                    os.makedirs(iter_dir, exist_ok=True)
+
+                    # Validation scenario: Asymmetric cross-ventilation
+                    v_nom = np.zeros(num_windows, dtype=np.float32)
+                    if num_windows >= 1:
+                        v_nom[0] = 1.5
+                    if num_windows >= 4:
+                        v_nom[3] = 1.2
+                    if num_windows >= 8:
+                        v_nom[7] = 1.5
+                    n_nom = 30.0
+                    for t_val in time_slices:
+                        t_col = np.full((grid_pts.shape[0], 1), fill_value=t_val, dtype=np.float32)
+                        v_mat = np.tile(v_nom, (grid_pts.shape[0], 1))
+                        n_col = np.full((grid_pts.shape[0], 1), fill_value=n_nom, dtype=np.float32)
+                        eval_inp = torch.tensor(
+                            np.hstack([grid_pts, t_col, v_mat, n_col]), dtype=torch.float32, device=device
+                        )
+                        preds = model(eval_inp).cpu().numpy()
+
+                        vtu = pv.PolyData(grid_pts).cast_to_unstructured_grid()
+                        vtu.point_data["velocity_u"] = preds[:, 0]
+                        vtu.point_data["velocity_v"] = preds[:, 1]
+                        vtu.point_data["velocity_w"] = preds[:, 2]
+                        vtu.point_data["velocity_mag"] = np.linalg.norm(preds[:, 0:3], axis=1)
+                        vtu.point_data["pressure"] = preds[:, 3]
+                        vtu.point_data["pollutant_c"] = preds[:, 4]
+
+                        vtu_name = f"multi_win_n_{n_nom:.0f}_t_{t_val:05.1f}s.vtu"
+                        vtu.save(os.path.join(iter_dir, vtu_name))
+                        pvd_entries.append((float(t_val), vtu_name))
+
+                    pvd_path = os.path.join(iter_dir, "multi_window_timelapse.pvd")
+                    write_pvd_file(pvd_path, pvd_entries)
+
+                extra_meta = build_extra_meta()
+                save_training_checkpoint(
+                    os.path.join(output_dir, f"model_checkpoint_{i:05d}.pth"),
+                    iteration=i,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=None,
+                    extra_metadata=extra_meta,
+                )
+                save_training_checkpoint(
+                    os.path.join(output_dir, "model_latest.pth"),
+                    iteration=i,
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=None,
+                    extra_metadata=extra_meta,
+                )
+
+            if stop_requested["flag"]:
+                interrupted_at = i
+                break
+
+    except KeyboardInterrupt:
+        signal.signal(signal.SIGINT, previous_sigint)
+        log.warning(
+            f"Training aborted at iteration {i} without saving. The newest checkpoint on disk "
+            f"is {os.path.join(output_dir, 'model_latest.pth')}."
+        )
+        return
+
+    signal.signal(signal.SIGINT, previous_sigint)
+
+    if interrupted_at is not None:
+        extra_meta = build_extra_meta()
+        interrupted_path = os.path.join(output_dir, f"model_interrupted_{interrupted_at:05d}.pth")
+        for path in (interrupted_path, os.path.join(output_dir, "model_latest.pth")):
             save_training_checkpoint(
-                os.path.join(output_dir, f"model_checkpoint_{i:05d}.pth"),
-                iteration=i,
+                path,
+                iteration=interrupted_at,
                 model=model,
                 optimizer=optimizer,
                 scheduler=None,
                 extra_metadata=extra_meta,
             )
-            save_training_checkpoint(
-                os.path.join(output_dir, "model_latest.pth"),
-                iteration=i,
-                model=model,
-                optimizer=optimizer,
-                scheduler=None,
-                extra_metadata=extra_meta,
-            )
+        elapsed = time.time() - start_time
+        log.info(
+            f"Training stopped by user after iteration {interrupted_at} "
+            f"({format_duration(elapsed)} this session). Saved {interrupted_path}\n"
+            f"  Resume with: .venv/bin/python training/train_parametric_multi_window_tanh.py "
+            f"resume={os.path.join(output_dir, 'model_latest.pth')}"
+        )
+        return
 
     extra_meta = build_extra_meta()
     save_training_checkpoint(

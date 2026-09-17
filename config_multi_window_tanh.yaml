@@ -10,11 +10,11 @@
 #
 # Launch from repo root:
 #   .venv/bin/python training/train_parametric_multi_window_tanh.py
-#   .venv/bin/python training/train_parametric_multi_window_tanh.py arch.num_layers=6 arch.layer_size=256
+#   .venv/bin/python training/train_parametric_multi_window_tanh.py arch.num_layers=8 arch.layer_size=512
 
 arch:
-  num_layers: 5            # HIDDEN layers; PhysicsNeMo adds a separate linear output layer
-  layer_size: 128
+  num_layers: 6            # HIDDEN layers; PhysicsNeMo adds a separate linear output layer
+  layer_size: 256
   activation: tanh         # any ACT2FN key: tanh silu gelu sin softplus elu selu relu ...
                            # do NOT use "stan": broken in physicsnemo 2.2.1 (Stan() is built
                            # with out_features=1 and raises unless layer_size == 1)
@@ -26,13 +26,14 @@ optimizer:
   lr: 1.0e-3               # flat: this script constructs NO lr_scheduler at all
 
 # total = phy*L_phy + walls*L_walls + windows*L_windows + doors*L_doors + ic*L_ic
-# Doors and IC already converge to ~0 in the baseline, so they stay at 1.0 (their
-# gradients are near-zero, which makes their weight nearly inert either way).
-# Set all five to 1.0 to reproduce train_parametric_multi_window.py exactly.
+# All five default to 1.0, which reproduces train_parametric_multi_window.py exactly
+# (that trainer sums the terms unweighted). Raise walls/windows (e.g. 100.0) to push
+# the boundary conditions harder; doors and IC already converge to ~0, so their
+# gradients are near-zero and their weight is nearly inert either way.
 loss_weights:
   phy: 1.0
-  walls: 100.0
-  windows: 100.0
+  walls: 1.0
+  windows: 1.0
   doors: 1.0
   ic: 1.0
 
