@@ -19,17 +19,23 @@ pinn_training/
 │   ├── finetune_initial_velocity.py# Fine-tune checkpoint for custom IC (u0, v0, w0)
 │   ├── train_parametric.py         # 5D (x,y,z,t,V_inlet) Parametric PINN (120s, 30k iters)
 │   ├── train_parametric_occupancy.py # 6D (x,y,z,t,V_inlet,N_people) Parametric PINN
-│   └── train_parametric_multi_window.py # 13D (x,y,z,t,V_1..V_8,N_people) Multi-Window PINN
+│   ├── train_parametric_multi_window.py # 13D (x,y,z,t,V_1..V_8,N_people) Multi-Window PINN
+│   ├── train_parametric_multi_window_tanh.py # 13D Multi-Window, tunable arch (Tanh, flat LR, weighted loss)
+│   ├── checkpoint_utils.py         # Checkpoint save/load, resume & warm-start helpers
+│   ├── geometry_utils.py           # STL domain extraction, window decomposition, obstacle masking
+│   └── verify_geometry_match.py    # Regression check: geometry_utils vs legacy baseline
 ├── inference/                      # Forward evaluation & visualization exporters
 │   ├── inference_steady.py         # Steady-state field, streamline & sweep exporter
 │   ├── inference_time_dependent.py # Physical time-lapse & unsteady pathline exporter (120s)
 │   ├── inference_parametric.py     # Real-time query for arbitrary V_inlet (0.2 - 2.5 m/s)
 │   ├── inference_parametric_occupancy.py # Real-time query for arbitrary V_inlet & N_people
-│   └── inference_parametric_multi_window.py # Real-time query for independent window velocities (V1..V8)
+│   ├── inference_parametric_multi_window.py # Real-time query for independent window velocities (V1..V8)
+│   └── inference_parametric_multi_window_tanh.py # Tunable-arch query (rebuilds the trained activation)
 ├── rendering/                      # Headless visualization & video rendering
 │   └── paraview_animate.py         # ParaView / pvpython batch animation renderer
 ├── outputs/                        # Checkpoints (.pth), snapshots (.vtu), and collections (.pvd)
 ├── config.yaml                     # Model architecture and scheduler config
+├── config_multi_window_tanh.yaml   # Live config for the tunable-architecture trainer
 └── README.md
 ```
 
@@ -52,7 +58,7 @@ brew install uv
 uv sync
 ```
 
-### 4. Run scripts
+### 3. Run scripts
 
 Use `.venv/bin/python` to invoke any script directly (no need to activate the environment):
 
@@ -162,13 +168,81 @@ $$\begin{aligned}
 
 ---
 
-#### 1.6 13D Multi-Window Parametric PINN ($V_1 \\dots V_8 \\in [0.2,\\, 2.5]\\,\\text{m/s},\\; N_{\\text{people}} \\in [0,\\, 50]$)
-*Trains a 13D surrogate model predicting airflow and $\\text{CO}_2$ concentration for independent window velocities and occupant count.*
+#### 1.6 13D Multi-Window Parametric PINN ($V_1 \dots V_8 \in [0,\, 2.5]\,\text{m/s},\; N_{\text{people}} \in [0,\, 50]$)
+*Trains a 13D surrogate model predicting airflow and $\text{CO}_2$ concentration for independent window velocities and occupant count.*
 ```bash
 .venv/bin/python training/train_parametric_multi_window.py
 ```
-- **What it does:** Trains a 13D MLP $(x, y, z, t, V_1, V_2, V_3, V_4, V_5, V_6, V_7, V_8, N_{\\text{people}}) \\to (u, v, w, p, c)$ where each $V_i$ represents the independent inlet velocity for window $i$, and the $\\text{CO}_2$ source rate scales with occupancy ($S_0 = N_{\\text{people}} \\times 1.15 \\times 10^{-4}\\,\\text{g}/(\\text{m}^3\\cdot\\text{s})$).
+- **What it does:** Trains a 13D MLP $(x, y, z, t, V_1, V_2, V_3, V_4, V_5, V_6, V_7, V_8, N_{\text{people}}) \to (u, v, w, p, c)$ where each $V_i$ represents the independent inlet velocity for window $i$, and the $\text{CO}_2$ source rate scales with occupancy ($S_0 = N_{\text{people}} \times 1.15 \times 10^{-4}\,\text{g}/(\text{m}^3\cdot\text{s})$).
 - **Outputs:** Saves `outputs/YYYY-MM-DD/parametric_multi_window/model_final.pth`.
+
+---
+
+#### 1.7 Tunable-Architecture 13D Multi-Window PINN ($V_1 \dots V_8 \in [0,\, 2.5]\,\text{m/s},\; N_{\text{people}} \in [0,\, 50]$)
+*Identical 13D physics, geometry and sampling to 1.6, but with a configurable network, a flat learning rate, and per-term loss weights — built for finding which architecture actually converges.*
+```bash
+# Train with the defaults in config_multi_window_tanh.yaml: 5 hidden layers x 128, Tanh
+.venv/bin/python training/train_parametric_multi_window_tanh.py
+```
+
+- **What it does:** Trains the same 13D MLP $(x, y, z, t, V_1, \dots, V_8, N_{\text{people}}) \to (u, v, w, p, c)$ as 1.6. Only the network and the optimization recipe differ:
+
+  | | 1.6 `train_parametric_multi_window.py` | 1.7 `train_parametric_multi_window_tanh.py` |
+  | :--- | :--- | :--- |
+  | Depth / width | 6 hidden $\times$ 512 (hardcoded) | configurable, default 5 hidden $\times$ 128 |
+  | Activation | SiLU (PhysicsNeMo default) | configurable, default **Tanh** |
+  | Learning rate | `LambdaLR` exponential decay | **flat, no scheduler** |
+  | Loss | unweighted sum of all 5 terms | per-term weights, default `walls=windows=100` |
+  | Logging | weighted total only | weighted total **and** raw unweighted per-term |
+
+- **Configuration:** every knob lives in [config_multi_window_tanh.yaml](config_multi_window_tanh.yaml) and is overridable on the command line. Valid activations are any PhysicsNeMo `ACT2FN` key (`tanh`, `silu`, `gelu`, `sin`, `softplus`, `elu`, ...); do **not** use `stan`, which is registered but broken in physicsnemo 2.2.1.
+- **Outputs:** Saves `outputs/YYYY-MM-DD/parametric_multi_window_<activation>_L<num_layers>_W<layer_size>/model_final.pth`. The run directory is auto-named from the architecture, so sweeps never overwrite each other. Each run also writes its own `launch.log` and a `loss_history.csv` for comparing runs.
+
+Overriding the architecture and recipe:
+```bash
+# A wider, deeper network
+.venv/bin/python training/train_parametric_multi_window_tanh.py \
+  arch.num_layers=6 arch.layer_size=256
+
+# Exact parity with the AIQ notebook architecture (4 hidden x 64, Tanh -> 13,701 params)
+.venv/bin/python training/train_parametric_multi_window_tanh.py \
+  arch.num_layers=4 arch.layer_size=64 arch.activation=tanh
+
+# Reproduce 1.6's unweighted loss, to isolate the effect of the architecture alone
+.venv/bin/python training/train_parametric_multi_window_tanh.py \
+  loss_weights.phy=1.0 loss_weights.walls=1.0 loss_weights.windows=1.0 \
+  loss_weights.doors=1.0 loss_weights.ic=1.0
+
+# Halved collocation counts for faster iteration on a MacBook (MPS)
+.venv/bin/python training/train_parametric_multi_window_tanh.py \
+  points.interior=4000 points.walls=1000 points.windows_per_window=75 \
+  points.doors=500 points.ic=1000
+```
+
+Sweeping to find what converges — `--multirun` is safe because run directories are auto-named:
+```bash
+# 1. Sweep depth x width (9 runs), short runs to compare early convergence slope
+.venv/bin/python training/train_parametric_multi_window_tanh.py --multirun \
+  arch.num_layers=4,5,6 arch.layer_size=64,128,256 \
+  max_iters=3000 snapshot_every=1000
+
+# 2. Sweep the activation function (4 runs)
+.venv/bin/python training/train_parametric_multi_window_tanh.py --multirun \
+  arch.activation=tanh,silu,gelu,sin \
+  max_iters=3000 snapshot_every=1000
+
+# 3. Compare the RAW (unweighted) losses across every run in the sweep
+for d in outputs/$(date +%F)/parametric_multi_window_*_L*_W*/; do
+  printf '%-52s %s\n' "$(basename "$d")" "$(tail -1 "$d/loss_history.csv")"
+done
+```
+> Compare runs on the **raw** columns (`raw_phy`, `raw_walls`, `raw_windows`), not `weighted_total` — the raw values use formulas identical to 1.6, so they stay comparable both across weightings and against a 1.6 baseline run. Note that `--multirun` creates a `multirun/` directory at the repo root for Hydra's own job logs; you may want to add it to `.gitignore`.
+
+Resuming works the same as every other trainer, and the architecture is validated on load — a depth, width or activation mismatch fails immediately with a clear message instead of a raw tensor-shape error:
+```bash
+.venv/bin/python training/train_parametric_multi_window_tanh.py \
+  resume=outputs/2026-09-17/parametric_multi_window_tanh_L5_W128/model_checkpoint_10000.pth
+```
 
 ### Resuming Training & Loading Checkpoints
 
@@ -333,7 +407,83 @@ Evaluate arbitrary combinations of independent window velocities across all 8 wi
 
 ---
 
-#### 2.5 Generating Steady-State Visualizations ([inference/inference_steady.py](inference/inference_steady.py))
+#### 2.5 Generating Tunable-Architecture Multi-Window Visualizations ([inference/inference_parametric_multi_window_tanh.py](inference/inference_parametric_multi_window_tanh.py))
+
+Companion to the 1.7 trainer. The CLI is identical to 2.4; two things behave differently, and both matter:
+
+- It **rebuilds the network with the activation recorded in the checkpoint.** Tanh, SiLU and GELU are parameterless, so a Tanh-trained checkpoint loads into a SiLU-built network with the same weights and *no error at all*, silently producing wrong fields. This script reads `model_config["activation"]` and rebuilds correctly.
+- The **window count is read from the checkpoint** instead of being hardcoded to 8, so it works for any `Windows.stl` decomposition.
+
+It stays backwards compatible: pointed at a pre-1.7 checkpoint it prints a note and falls back to PhysicsNeMo's `silu` default, which is the correct activation for those runs.
+
+```bash
+# 0. Point this at whichever run you want to evaluate
+RUN=outputs/2026-09-17/parametric_multi_window_tanh_L5_W128
+
+# 1. Open Windows 1, 4 and 8 at 1.5 m/s (others closed) and export a 2D slice PNG
+.venv/bin/python inference/inference_parametric_multi_window_tanh.py \
+  --checkpoint $RUN/model_final.pth \
+  --open-windows 1 4 8 \
+  --open-velocity 1.5 \
+  --occupancy 25.0 \
+  --time 60.0 \
+  --save-slice
+
+# 2. Specify independent velocities for all 8 windows explicitly
+.venv/bin/python inference/inference_parametric_multi_window_tanh.py \
+  --checkpoint $RUN/model_final.pth \
+  --velocities 1.5 0.0 0.0 1.2 0.0 0.0 0.0 1.5 \
+  --occupancy 30.0 \
+  --time 30.0
+
+# 3. Export the full animation time-lapse sequence (PVD + VTU) for ParaView
+.venv/bin/python inference/inference_parametric_multi_window_tanh.py \
+  --checkpoint $RUN/model_final.pth \
+  --open-windows 1 4 8 \
+  --open-velocity 1.5 \
+  --occupancy 30.0 \
+  --timelapse \
+  --n-frames 60
+```
+
+On load it prints the architecture it reconstructed, so an unexpected checkpoint is obvious straight away rather than after a confusing field:
+```text
+Rebuilding FullyConnected(13 -> 5 x 128 [tanh] -> 5), skip_connections=False, weight_norm=False
+Multi-window checkpoint with 8 windows (in_features=13).
+```
+
+Unlike 2.4, outputs default to an `inference/` directory **next to the checkpoint**, so results stay with the run that produced them (override with `--output-dir`). The ParaView-loadable artifacts are:
+
+| Artifact | Path | Open in ParaView as |
+| :--- | :--- | :--- |
+| Inference time-lapse | `$RUN/inference/timelapse/timelapse_multi_window.pvd` | animated collection ($t = 0 \to 120\,\text{s}$) |
+| Inference snapshot | `$RUN/inference/snapshot_t_60.0s.vtu` | single unstructured grid |
+| Inference 2D slice | `$RUN/inference/slice_t_60.0s.png` | image, no ParaView needed |
+| In-training validation snapshot | `$RUN/snapshots_iter_10000/multi_window_timelapse.pvd` | animated collection, 5 time slices |
+
+All carry the same point-data arrays as every other exporter in this repo — `velocity_u`, `velocity_v`, `velocity_w`, `velocity_mag`, `pressure`, `pollutant_c` — so they render with the existing ParaView tooling in Step 3 unchanged:
+
+```bash
+# Render the inference time-lapse straight to an AVI, colored by pollutant concentration
+/Applications/ParaView-6.1.1.app/Contents/bin/pvpython rendering/paraview_animate.py \
+  --type timelapse \
+  --input $RUN/inference/timelapse/timelapse_multi_window.pvd \
+  --field pollutant_c \
+  --format avi \
+  --resolution 1920x1080
+
+# Render the in-training validation snapshot as PNG frames, top-down camera
+/Applications/ParaView-6.1.1.app/Contents/bin/pvpython rendering/paraview_animate.py \
+  --type timelapse \
+  --input $RUN/snapshots_iter_10000/multi_window_timelapse.pvd \
+  --field velocity_mag \
+  --camera top \
+  --format png
+```
+
+---
+
+#### 2.6 Generating Steady-State Visualizations ([inference/inference_steady.py](inference/inference_steady.py))
 
 ```bash
 # Export 3D volume, steady streamlines, and spatial slice sweep
@@ -358,6 +508,9 @@ Evaluate arbitrary combinations of independent window velocities across all 8 wi
    - For Time-Lapse Grid: `outputs/2026-09-15/time_dependent/animations/timelapse/timelapse.pvd`
    - For Particle Pathlines: `outputs/2026-09-15/time_dependent/animations/particles/particles.pvd`
    - For Parametric: `outputs/2026-09-15/parametric/animations/v_1.80/timelapse_v_1.80/timelapse_v_1.80.pvd`
+   - For Multi-Window inference: `outputs/2026-09-16/parametric_multi_window/inference/timelapse/timelapse_multi_window.pvd`
+   - For Tunable-Architecture inference: `outputs/2026-09-17/parametric_multi_window_tanh_L5_W128/inference/timelapse/timelapse_multi_window.pvd`
+   - For in-training validation snapshots: `outputs/2026-09-17/parametric_multi_window_tanh_L5_W128/snapshots_iter_10000/multi_window_timelapse.pvd`
 3. In the **Properties** panel on the left, click **Apply**.
 4. In the top toolbar, change **Solid Color** $\to$ **`velocity_mag`** or **`pollutant_c`**.
 5. Press the **▶ Play** button in the animation toolbar at the top. ParaView will scrub through physical simulation seconds ($t = 0 \to 120\,\text{s}$).
@@ -411,8 +564,10 @@ You can render full HD PNG image sequences or AVI videos directly from the comma
 | **Train Parametric** | `training/train_parametric.py` | `.venv/bin/python training/train_parametric.py` |
 | **Train Occupancy** | `training/train_parametric_occupancy.py` | `.venv/bin/python training/train_parametric_occupancy.py` |
 | **Train Multi-Window** | `training/train_parametric_multi_window.py` | `.venv/bin/python training/train_parametric_multi_window.py` |
+| **Train Multi-Window (tunable arch)** | `training/train_parametric_multi_window_tanh.py` | `.venv/bin/python training/train_parametric_multi_window_tanh.py arch.num_layers=5 arch.layer_size=128 arch.activation=tanh` |
 | **Unsteady Inference**| `inference/inference_time_dependent.py`| `.venv/bin/python inference/inference_time_dependent.py --checkpoint <ckpt> --animate all` |
 | **Parametric Query** | `inference/inference_parametric.py` | `.venv/bin/python inference/inference_parametric.py --checkpoint <ckpt> --velocity 1.8 --animate all` |
 | **Occupancy Query** | `inference/inference_parametric_occupancy.py` | `.venv/bin/python inference/inference_parametric_occupancy.py --checkpoint <ckpt> --velocity 1.5 --occupancy 30` |
 | **Multi-Window Query**| `inference/inference_parametric_multi_window.py` | `.venv/bin/python inference/inference_parametric_multi_window.py --checkpoint <ckpt> --open-windows 1 4 8 --open-velocity 1.5` |
+| **Multi-Window Query (tunable arch)**| `inference/inference_parametric_multi_window_tanh.py` | `.venv/bin/python inference/inference_parametric_multi_window_tanh.py --checkpoint <ckpt> --open-windows 1 4 8 --open-velocity 1.5 --timelapse` |
 | **Render Video/PNG** | `rendering/paraview_animate.py` | `/Applications/ParaView-6.1.1.app/Contents/bin/pvpython rendering/paraview_animate.py --input <pvd>` |

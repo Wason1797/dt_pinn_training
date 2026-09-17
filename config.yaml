@@ -31,3 +31,9 @@ arch:
 scheduler:
   initial_lr: 1.E-3
   decay_rate: .9995
+
+# Training, resumption & pretrained initialization options
+max_iters: 30000
+resume: null       # Path to checkpoint to continue training (restores optimizer, scheduler, iter)
+checkpoint: null   # Path to checkpoint for model initialization only (warm-start from iter 0)
+output_dir: null   # Optional custom output directory

@@ -1,0 +1,78 @@
+# SPDX-FileCopyrightText: Copyright (c) 2023 - 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: Apache-2.0
+#
+# LIVE config, read ONLY by training/train_parametric_multi_window_tanh.py.
+# Every key below is actually consumed - unlike the shared config.yaml, whose
+# arch: decoder/fno block and scheduler.decay_rate nothing reads.
+#
+# YAML gotcha: always write exponents with a decimal point (1.0e-3, NOT 1e-3).
+# PyYAML's YAML-1.1 resolver parses "1e-3" as a *string*.
+#
+# Launch from repo root:
+#   .venv/bin/python training/train_parametric_multi_window_tanh.py
+#   .venv/bin/python training/train_parametric_multi_window_tanh.py arch.num_layers=6 arch.layer_size=256
+
+arch:
+  num_layers: 5            # HIDDEN layers; PhysicsNeMo adds a separate linear output layer
+  layer_size: 128
+  activation: tanh         # any ACT2FN key: tanh silu gelu sin softplus elu selu relu ...
+                           # do NOT use "stan": broken in physicsnemo 2.2.1 (Stan() is built
+                           # with out_features=1 and raises unless layer_size == 1)
+  skip_connections: false  # links every 2 hidden layers; with an odd num_layers the last
+                           # layer gets no partner (harmless, just ineffective for it)
+  weight_norm: false       # NOTE: true changes the state_dict keys (adds linear.weight_g)
+
+optimizer:
+  lr: 1.0e-3               # flat: this script constructs NO lr_scheduler at all
+
+# total = phy*L_phy + walls*L_walls + windows*L_windows + doors*L_doors + ic*L_ic
+# Doors and IC already converge to ~0 in the baseline, so they stay at 1.0 (their
+# gradients are near-zero, which makes their weight nearly inert either way).
+# Set all five to 1.0 to reproduce train_parametric_multi_window.py exactly.
+loss_weights:
+  phy: 1.0
+  walls: 100.0
+  windows: 100.0
+  doors: 1.0
+  ic: 1.0
+
+points:                     # defaults match the baseline so runs stay comparable
+  interior: 8000
+  walls: 2000
+  windows_per_window: 150   # PER window body -> 150 x 8 = 1200 total
+  doors: 1000
+  ic: 2000
+
+# Halved set for faster MacBook/MPS runs. YAML forbids duplicate keys, so comment
+# out the block above FIRST. Or override per-run without editing this file:
+#   points.interior=4000 points.walls=1000 points.windows_per_window=75 \
+#   points.doors=500 points.ic=1000
+
+physics:
+  t_max: 120.0
+  v_min: 0.0                # 0.0 is intentional: a closed window is V_k = 0, and the
+                            # inflow ramps in via tanh (see tau_ramp)
+  v_max: 2.5
+  n_people_min: 0.0
+  n_people_max: 50.0
+  tau_ramp: 2.0             # v_target = -V_k * tanh(3t/tau_ramp)
+  nu: 0.01                  # kinematic viscosity [m^2/s]
+  rho: 1.0                  # density [kg/m^3]
+  diffusivity: 0.005        # CO2 mass diffusivity D [m^2/s]
+  emission_per_person: 1.15e-4   # g/(m^3*s) per occupant
+  sigma: 2.5                # Gaussian occupancy spread [m]
+  breathing_height: 1.10    # seated breathing plane Z [m]
+
+max_iters: 30000
+log_every: 10
+snapshot_every: 1000
+snapshot_resolution: 35
+log_csv: true               # loss_history.csv in the run dir, for sweep comparison
+
+resume: null                # path to checkpoint -> restore weights + optimizer + iteration
+checkpoint: null            # path to checkpoint -> weights only, restart at iteration 0
+
+# null -> auto-name: parametric_multi_window_<activation>_L<num_layers>_W<layer_size>
+# Auto-naming keeps sweeps from overwriting each other's model_latest.pth, and keeps
+# every run out of the baseline's outputs/<date>/parametric_multi_window/.
+output_subdir: null
